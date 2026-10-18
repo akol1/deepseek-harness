@@ -1,0 +1,1073 @@
+From eb36de1b16057d4f64cc17adaf4856034cae6f30 Mon Sep 17 00:00:00 2001
+From: akol1 <15747200+akol1@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 15:41:44 -0700
+Subject: [PATCH] fix(ui-workspace): keep an unstarted draft when a New Session
+ starts
+
+A New Session that starts without a preset opens a new Session and unmounts the blank the user was typing in, so the typed draft stays under the abandoned Session and the new composer is empty. Hand the abandoned blank drafts to the new Session's composer through conversation.input.handOffDraft before selection publishes, and keep the source draft when the target already holds input or its record cannot be written.
+
+The hand-off reuses the structured DraftSnapshot path, writes the adopted draft beside the target's View preference, and drops the source key only after the target write succeeds. Attachments stay with the Session that owns their browser objects.
+---
+ ...-structured-draft-initialization.i18n.yaml |  23 +--
+ ...6-09-30-structured-draft-initialization.md |  22 ++-
+ ...9-30-structured-draft-initialization.zh.md |  22 ++-
+ apps/web/tests/draft-initialization.e2e.ts    |  25 +++-
+ .../client/ui-conversation/README.i18n.yaml   |   4 +-
+ packages/client/ui-conversation/README.md     |   2 +-
+ packages/client/ui-conversation/README.zh.md  |   2 +-
+ .../src/client/contract/input.ts              |  15 ++
+ .../ui-conversation/src/client/draft.ts       |   9 ++
+ .../src/client/input/facade.ts                |  13 ++
+ .../ui-conversation/src/client/input/hub.ts   |  34 ++++-
+ .../ui-conversation/src/client/stores.ts      |  36 +++++
+ .../tests/conversation-store.client.spec.ts   |  76 +++++++++-
+ .../tests/draft-hub.client.spec.ts            | 141 ++++++++++++++++++
+ packages/client/ui-workspace/README.i18n.yaml |   8 +-
+ packages/client/ui-workspace/README.md        |   4 +-
+ packages/client/ui-workspace/README.zh.md     |   4 +-
+ .../ui-workspace/src/client/navigation.ts     |  64 +++++++-
+ .../tests/workspaces-service.client.spec.ts   | 110 +++++++++++++-
+ .../src/client/api-catalog.ts                 |   4 +-
+ 20 files changed, 569 insertions(+), 49 deletions(-)
+
+diff --git a/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.i18n.yaml b/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.i18n.yaml
+index 16a39c6917..f8ab12826d 100644
+--- a/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.i18n.yaml
++++ b/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.i18n.yaml
+@@ -11,12 +11,15 @@
+ /agent-note-initial-draft-content-and-structured-reference-restoration/decision:
+   en: 9cf2afd9d5e663e9
+   zh: ad59b1bec6ec4666
++/agent-note-initial-draft-content-and-structured-reference-restoration/decision/abandoned-blank-hand-off:
++  en: da2f4b2a58ad123e
++  zh: db92df3838436289
+ /agent-note-initial-draft-content-and-structured-reference-restoration/decision/data-model:
+-  en: 7f33895364a9f5cc
+-  zh: f1c79ea15f5c151e
++  en: 60ea0ec743c9582a
++  zh: e88a8713811e6056
+ /agent-note-initial-draft-content-and-structured-reference-restoration/decision/classes-and-methods:
+-  en: ca81423a57f898a0
+-  zh: 98962cc1c6bce113
++  en: 99c544212f7d8446
++  zh: 61af9aae1a23e314
+ /agent-note-initial-draft-content-and-structured-reference-restoration/decision/data-flow:
+   en: dd57e639e9328f1d
+   zh: 5e16cb2e3a73597c
+@@ -24,11 +27,11 @@
+   en: 3b6a99c417384470
+   zh: b62951995eda2fb0
+ /agent-note-initial-draft-content-and-structured-reference-restoration/alternatives-considered:
+-  en: eddaec471425fafc
+-  zh: b206ecdb12e8c33d
++  en: ba5bea3effedc077
++  zh: 2e0ab3efefde1b48
+ /agent-note-initial-draft-content-and-structured-reference-restoration/verification:
+-  en: 341f4f36936f686a
+-  zh: 479fbe04e810f640
++  en: f137e69798dc50f6
++  zh: bd69c0cd1baea77c
+ /agent-note-initial-draft-content-and-structured-reference-restoration/consequences:
+-  en: ff4f9527db80f790
+-  zh: f3e57093c058f643
++  en: 36e808dae684453e
++  zh: 4da184b061184bd4
+diff --git a/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.md b/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.md
+index 678129340f..60ef36c8a2 100644
+--- a/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.md
++++ b/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.md
+@@ -14,22 +14,28 @@ Keep the existing `SessionInputShell`, `DraftEditorRuntime`, Conversation store,
+ 
+ The second parameter of `startSession(workspaceId?, options?)` contains `prompt` and `clearPreviousDraft`. `prompt` accepts only a string; structured drafts remain internal to restoration and Workspace transfer. Omitting options preserves the existing flow. Without clearing, existing content is preserved and only an empty draft adopts the prompt. Explicit clearing replaces the target Session's text document, without deleting attachments or changing other Sessions. Prefilling does not send, execute commands, or change `blank`.
+ 
++### Abandoned blank hand-off
++
++A New Session started without a preset opens a new Session instead of continuing the mounted blank, so a draft typed there stays under the Session the user leaves and the new composer starts empty. `UiWorkspaceService` collects the blank Sessions the navigation abandons in the target Workspace and passes their ids to `conversation.input.handOffDraft` inside the target preparation point. The resolver imports the first candidate that holds an unsent draft through the same shell path, saves it under the target key, and drops the abandoned key. Candidates without content are skipped, the target is never a source, and a target that already holds text, attachments, or a refused submission keeps both drafts. Attachments stay with the Session that owns their browser objects, and an abandoned blank that is not mounted contributes its last saved draft.
++
+ ### Data model
+ 
+ `DraftSnapshot` contains `text` and `references`. Each reference retains `offset`, `length`, `source`, `ref`, `label`, `appearance`, `clipboardText`, and its existing invalid flag. Positions use JavaScript string coordinates. Reference spans must be ordered, non-overlapping, and equal the corresponding `clipboardText`. Snapshots exclude Lexical NodeKeys, DOM, runtime occurrenceIds, functions, and temporary highlights.
+ 
+ A string represents input without structured references; an ambiguous `@` query never selects a file automatically. The public `SessionInput.setDraft` and `InputActions.setDraft` methods accept only text. Internal structured restoration reuses the editor's reference restoration without listing directories or reading files. Plain text and file, folder, and Session chips all pass through the registered editor transforms and projection.
+ 
+-The existing `dsh.conversation.<sessionId>` key remains. Readers accept both legacy strings and structured `draft` values; new writes store structured values. The original Conversation store still writes the complete record, without a second writer for that key. Reference changes must reach persistence even when the visible text does not change.
++The existing `dsh.conversation.<sessionId>` key remains. Readers accept both legacy strings and structured `draft` values; new writes store structured values. The Conversation store writes the complete record for composer edits, and draft hand-off adds one targeted writer that replaces only the `draft` field and keeps the stored View. Reference changes must reach persistence even when the visible text does not change.
+ 
+ ### Classes and methods
+ 
+ | Location | Change and responsibility |
+ | --- | --- |
+-| `UiWorkspace` / `UiWorkspaceService.startSession` | The second parameter is `StartSessionOptions`; the existing `beforeOpen` preparation point passes initialization to the exact target binding. Creation, reuse, and navigation cancellation remain unchanged |
++| `UiWorkspace` / `UiWorkspaceService.startSession` | The second parameter is `StartSessionOptions`; the existing `beforeOpen` preparation point passes initialization to the exact target binding. A navigation that abandons blank Sessions in the target Workspace hands their drafts to the same preparation point. Creation, reuse, and navigation cancellation remain unchanged |
+ | `SessionInputResolver` / `InputHub.requestDraftInitialization` | Accept the binding and options and delegate to that binding's input object, without looking up a global current Session |
++| `SessionInputResolver` / `InputHub.handOffDraft` | Accept candidate Session ids and the retained target binding, adopt the first unsent draft into the target composer, save it under the target key, and drop the source key; require the target to be the retained generation and keep both drafts when it already holds input |
+ | `InputHub.shellFor` | After registering a new object and its cleanup, read the Session's saved draft, import it through the input model, and return. Reused objects are not restored again |
+ | `readConversationDraft(sessionId)` in `stores.ts` / `parseStoredDraft` in `draft.ts` | Read the original storage key, accept legacy strings, and check structured reference fields and positions without creating a store or another writer |
++| `writeConversationDraft(sessionId, draft)` / `hasDraftContent` | Save one draft beside the target's View preference and recognize whether a live or saved draft still carries unsent content; a denied write reports failure so the source key is not dropped |
+ | `SessionInputShell.setDraft` | The concrete internal method accepts a string or `DraftSnapshot` and imports one document through the editor; public input methods accept only text. Neither path simulates keyboard events or submits |
+ | `SessionInputShell.requestDraftInitialization` | Apply clear, preserve, and prefill rules to the restored model; refuse changes during submission without clearing first |
+ | `SessionInputShell.draftSnapshot` / `persistCurrentDraft()` | Cache snapshots without runtime IDs by content revision; `InputActions.persistDraft()` delegates explicit saving, while `bindDraftPersistence(write)` only binds the callback |
+@@ -41,7 +47,7 @@ The existing `dsh.conversation.<sessionId>` key remains. Readers accept both leg
+ 
+ There is no new draft service, storage key, general task framework, or Session creation entry point. SlotRenderer, Host Session logs, command execution, and file-discovery RPCs are unchanged. `InputActions` remains the shared input-action entry; components receive no separate content-initialization callback.
+ 
+-The call parameters are `startSession(workspaceId?: WorkspaceId, options?: StartSessionOptions)`, `requestDraftInitialization(binding: SessionBinding, options: DraftInitializationOptions)`, `SessionInputShell.requestDraftInitialization(options)`, and the internal `SessionInputShell.setDraft(input: string | DraftSnapshot)`. `StartSessionOptions` aliases `DraftInitializationOptions`, whose fields are `prompt?: string` and `clearPreviousDraft?: boolean`. A shallow copy captures these values before asynchronous creation, and the result addresses only the retained target binding. Initialization distinguishes applied, preserved, and submission-blocked outcomes. Refusal does not clear first; superseded navigation does not write a draft.
++The call parameters are `startSession(workspaceId?: WorkspaceId, options?: StartSessionOptions)`, `requestDraftInitialization(binding: SessionBinding, options: DraftInitializationOptions)`, `SessionInputShell.requestDraftInitialization(options)`, and the internal `SessionInputShell.setDraft(input: string | DraftSnapshot)`. `StartSessionOptions` aliases `DraftInitializationOptions`, whose fields are `prompt?: string` and `clearPreviousDraft?: boolean`. A shallow copy captures these values before asynchronous creation, and the result addresses only the retained target binding. Initialization distinguishes applied, preserved, and submission-blocked outcomes. Refusal does not clear first; superseded navigation does not write a draft. `handOffDraft(sources: readonly SessionId[], target: SessionBinding)` likewise addresses only the retained binding and reports applied, preserved, or blocked.
+ 
+ ### Data flow
+ 
+@@ -73,16 +79,18 @@ Skills remain editable text, not file chips. A pending lexicon never locks the d
+ 
+ **Splitting persistence keys or adding a draft-management service.** The existing input owner and store can perform the work by sharing the input representation and import path.
+ 
++**Reusing the abandoned blank instead of carrying its draft.** Continuing the same mounted blank for every New Session coalesces unrelated creations into one Session and stays retired by the [Session-generation change](../../../../docs/upgrade-guide/v0.2.1-alpha.1/new-session-generations/guide.md); carrying the draft keeps each New Session independent while the user's unsent text follows the navigation.
++
+ ## Verification
+ 
+-The core model invariants are semantic equivalence after import, export, and JSON round trips without comparing runtime node IDs; a complete document on the first input-object read; and stable draft snapshots across selection or skill-highlight changes. [Document-model cases](../../../../packages/client/ui-conversation/tests/draft-document.client.spec.ts) cover strings, empty drafts, multiline Unicode text, file/folder/Session references, duplicates, invalid flags, placeholder sanitization, and invalid stored spans. [Input-lifecycle cases](../../../../packages/client/ui-conversation/tests/draft-hub.client.spec.ts) cover first reads, reuse, lexicon-service arrival, unloading, reconnection, and retired bindings. Initialization is refused during submission, and lexicon rescans add no Undo step.
++The core model invariants are semantic equivalence after import, export, and JSON round trips without comparing runtime node IDs; a complete document on the first input-object read; and stable draft snapshots across selection or skill-highlight changes. [Document-model cases](../../../../packages/client/ui-conversation/tests/draft-document.client.spec.ts) cover strings, empty drafts, multiline Unicode text, file/folder/Session references, duplicates, invalid flags, placeholder sanitization, and invalid stored spans. [Input-lifecycle cases](../../../../packages/client/ui-conversation/tests/draft-hub.client.spec.ts) cover first reads, reuse, lexicon-service arrival, unloading, reconnection, retired bindings, and the New Session hand-off's candidate filtering, live and saved sources, existing target content, storage denial, and source-key removal. Initialization is refused during submission, and lexicon rescans add no Undo step.
+ 
+-[Navigation cases](../../../../packages/client/ui-workspace/tests/workspaces-service.client.spec.ts) check exact retained targets, option copying before asynchronous creation, superseded requests without draft writes, and refusal without changing selection. [Assembly cases](../../../../packages/client/ui-conversation/tests/apply-inject.client.spec.tsx) check that existing Workspace transfer retains structured references. The related regression run passed 708 cases in 44 files; after the shared draft module moved to its owning location, the three affected model and assembly files passed another 66 cases.
++[Navigation cases](../../../../packages/client/ui-workspace/tests/workspaces-service.client.spec.ts) check exact retained targets, option copying before asynchronous creation, superseded requests without draft writes, refusal without changing selection, and the blank Sessions a New Session hands off. [Assembly cases](../../../../packages/client/ui-conversation/tests/apply-inject.client.spec.tsx) check that existing Workspace transfer retains structured references. The related regression run passed 708 cases in 44 files; after the shared draft module moved to its owning location, the three affected model and assembly files passed another 66 cases.
+ 
+-The [browser e2e](../../../../apps/web/tests/draft-initialization.e2e.ts) observes the shipped Workspace API through the existing module-loader test instrumentation and calls public `startSession` with text options, without an additional test plugin. Structured fixtures enter through the existing saved-draft restoration path. The cases cover absent, empty, and nonempty prompts; explicit and inherited Workspaces; preservation and clearing; creation and reuse; repeated real-UI Session switching and editing; reload; legacy strings; and Workspace-picker transfer. Both orders of delayed creation responses preserve the newer target and leave the other draft unchanged. A delayed real skill-catalog response rematches current text without replacing chips, selection, or Undo history. Assertions inspect chip fields, file previews, and persisted snapshots. Before sending, Host logs contain neither `user/message` nor `turn/start`.
++The [browser e2e](../../../../apps/web/tests/draft-initialization.e2e.ts) observes the shipped Workspace API through the existing module-loader test instrumentation and calls public `startSession` with text options, without an additional test plugin. Structured fixtures enter through the existing saved-draft restoration path. The cases cover absent, empty, and nonempty prompts; explicit and inherited Workspaces; preservation and clearing; creation and reuse; repeated real-UI Session switching and editing; reload; legacy strings; and Workspace-picker transfer. A typed draft crosses from the blank a New Session abandons into the new composer, including Unicode text and inline references. Both orders of delayed creation responses preserve the newer target and leave the other draft unchanged. A delayed real skill-catalog response rematches current text without replacing chips, selection, or Undo history. Assertions inspect chip fields, file previews, and persisted snapshots. Before sending, Host logs contain neither `user/message` nor `turn/start`.
+ 
+ ## Consequences
+ 
+-Missing reference information in legacy strings cannot be reconstructed losslessly, so they restore as plain text without searching and guessing files. Attachment File objects, upload state, cross-browser synchronization, multiple independent editors, and persistent Undo history are outside this change.
++Missing reference information in legacy strings cannot be reconstructed losslessly, so they restore as plain text without searching and guessing files. Hand-off moves text and inline references only: attachments stay in the abandoned Session, and adopting a blank's text leaves any uploads there. Attachment File objects, upload state, cross-browser synchronization, multiple independent editors, and persistent Undo history are outside this change.
+ 
+ This decision shares input ownership with the [editor-isolation proposal](../../proposed/architecture/2026-09-14-composer-model-and-draft-editor.md) without implementing its multi-editor goal. [Reference previews](../../../../packages/client/ui-input-trigger/README.md) and [Session reference lifetimes](2026-09-15-client-session-references.md) continue to govern source routing and generation cleanup independently; neither is superseded.
+diff --git a/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.zh.md b/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.zh.md
+index 07c185a969..7a350f1553 100644
+--- a/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.zh.md
++++ b/.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.zh.md
+@@ -14,22 +14,28 @@ Status: implemented
+ 
+ `startSession(workspaceId?, options?)` 的第二参数保留 `prompt` 与 `clearPreviousDraft`。`prompt` 仅接受字符串；结构化草稿只用于内部恢复和工作区携带。无选项时维持原流程。不清空时保留已有内容，空稿才采用 prompt；显式清空作用于目标 Session 的文字文档，不删除附件，也不修改其他 Session。预填不自动发送、执行命令或改变 `blank`。
+ 
++### 未开始草稿的交接
++
++带预设启动的新对话会新建 Session，不会续用当前挂载的空白会话，因此用户在该空白处输入的草稿留在被离开的 Session 下，新输入框是空的。`UiWorkspaceService` 收集这次导航在目标工作区中放弃的空白 Session，把它们的 id 交给目标准备点的 `conversation.input.handOffDraft`。解析器通过同一条输入对象路径导入第一个尚有未发送内容的候选项，保存到目标 key，再删除来源 key。没有内容的候选项跳过，目标自身永不作为来源；目标已有文字、附件或提交被拒绝时两份草稿都保留。附件仍留在拥有其浏览器对象的 Session；未挂载的空白会话只贡献最后一次保存的草稿。
++
+ ### 数据模型
+ 
+ `DraftSnapshot` 由 `text` 和 `references` 组成。每个引用保留 `offset`、`length`、`source`、`ref`、`label`、`appearance`、`clipboardText` 及已有的无效标记；位置使用 JavaScript 字符串坐标。引用位置必须有序、不重叠，且对应的正文片段与 `clipboardText` 一致。不保存 Lexical NodeKey、DOM、运行时 occurrenceId、函数或临时高亮。
+ 
+ 字符串等价于不含引用结构的输入；不会据模糊的 `@` 查询擅自选中某个文件。公开的 `SessionInput.setDraft` 与 `InputActions.setDraft` 仅接受文本。内部结构化恢复直接复用编辑器已有的引用恢复能力，无需查询文件目录或读取文件内容。恢复普通文字、文件胶囊、目录胶囊和 Session 胶囊都经过已注册的编辑器变换和投影流程。
+ 
+-现有 `dsh.conversation.<sessionId>` key 保留，`draft` 可读取旧字符串，也可读取新的结构化值；新写入保存结构化值。仍由原 Conversation store 写整个记录，不增加第二个同 key 写入者。引用变化即使没有改变显示文字，也必须进入持久化快照。
++现有 `dsh.conversation.<sessionId>` key 保留，`draft` 可读取旧字符串，也可读取新的结构化值；新写入保存结构化值。编辑器修改仍由 Conversation store 写整个记录；草稿交接增加一个只替换 `draft` 字段、保留已存 View 的定向写入者。引用变化即使没有改变显示文字，也必须进入持久化快照。
+ 
+ ### Class 与方法
+ 
+ | 位置 | 改动与职责 |
+ | --- | --- |
+-| `UiWorkspace`／`UiWorkspaceService.startSession` | 第二参数类型为 `StartSessionOptions`；在原 `beforeOpen` 准备点向准确的目标 binding 传入初始化请求。创建、复用与导航取消路径不变 |
++| `UiWorkspace`／`UiWorkspaceService.startSession` | 第二参数类型为 `StartSessionOptions`；在原 `beforeOpen` 准备点向准确的目标 binding 传入初始化请求。导航在目标工作区放弃空白 Session 时，在同一准备点交接它们的草稿。创建、复用与导航取消路径不变 |
+ | `SessionInputResolver`／`InputHub.requestDraftInitialization` | 接收 binding 和 options，交给该 binding 的输入对象，不重新查找全局当前 Session |
++| `SessionInputResolver`／`InputHub.handOffDraft` | 接收候选 Session id 和保留的目标 binding，把第一份未发送草稿放入目标输入框，保存到目标 key 并删除来源 key；目标必须是当前保留的代次，已有输入时两份草稿都保留 |
+ | `InputHub.shellFor` | 新对象登记及清理接线后，读取该 Session 保存的草稿，通过输入模型导入，然后返回；复用对象不再恢复 |
+ | `stores.ts` 的 `readConversationDraft(sessionId)`／`draft.ts` 的 `parseStoredDraft` | 只读原存储 key；兼容字符串并检查结构化引用的位置和字段，不创建 store 或增加写入者 |
++| `writeConversationDraft(sessionId, draft)`／`hasDraftContent` | 在保留目标 View 偏好的前提下保存一份草稿，并判断活动或已存草稿是否仍有未发送内容；写入被拒绝时报告失败，来源 key 不删除 |
+ | `SessionInputShell.setDraft` | 具体类的内部方法接受字符串或 `DraftSnapshot`，向编辑器发送一次文档导入；公开输入方法仅接受文本。两条路径均不模拟键盘事件、不提交内容 |
+ | `SessionInputShell.requestDraftInitialization` | 在已经恢复的模型上执行清空／保留／填入规则；提交中拒绝修改，失败前不先清稿 |
+ | `SessionInputShell.draftSnapshot`／`persistCurrentDraft()` | 按内容修订号缓存不含运行时 ID 的快照；`InputActions.persistDraft()` 委托显式保存方法；`bindDraftPersistence(write)` 仍只绑定回调 |
+@@ -41,7 +47,7 @@ Status: implemented
+ 
+ 不新增草稿服务、存储 key、通用任务框架或另一套 Session 创建入口；不改 SlotRenderer、Host Session 日志、命令执行和文件发现 RPC。`InputActions` 保留统一输入操作入口，组件不单独注入另一条内容初始化回调。
+ 
+-调用参数依次为 `startSession(workspaceId?: WorkspaceId, options?: StartSessionOptions)`、`requestDraftInitialization(binding: SessionBinding, options: DraftInitializationOptions)`、`SessionInputShell.requestDraftInitialization(options)`，以及内部的 `SessionInputShell.setDraft(input: string | DraftSnapshot)`。`StartSessionOptions` 直接引用 `DraftInitializationOptions`，字段为 `prompt?: string` 和 `clearPreviousDraft?: boolean`；进入异步创建前浅拷贝这些值，结果只作用于最终保留的 binding。初始化结果区分已应用、保留原稿和提交期间拒绝；拒绝不先清空，导航被后续操作取消时不写稿。
++调用参数依次为 `startSession(workspaceId?: WorkspaceId, options?: StartSessionOptions)`、`requestDraftInitialization(binding: SessionBinding, options: DraftInitializationOptions)`、`SessionInputShell.requestDraftInitialization(options)`，以及内部的 `SessionInputShell.setDraft(input: string | DraftSnapshot)`。`StartSessionOptions` 直接引用 `DraftInitializationOptions`，字段为 `prompt?: string` 和 `clearPreviousDraft?: boolean`；进入异步创建前浅拷贝这些值，结果只作用于最终保留的 binding。初始化结果区分已应用、保留原稿和提交期间拒绝；拒绝不先清空，导航被后续操作取消时不写稿。`handOffDraft(sources: readonly SessionId[], target: SessionBinding)` 同样只作用于保留的 binding，结果区分已应用、保留原稿和拒绝。
+ 
+ ### 数据流
+ 
+@@ -73,16 +79,18 @@ skill 是可编辑文字，不转为文件胶囊。词典尚未返回时不锁
+ 
+ **拆分持久化 key 或新增草稿管理服务。** 现有输入 owner 和 store 已能承担职责，只需统一输入数据与导入路径。
+ 
++**续用被放弃的空白会话，而不是交接草稿。** 让每个新对话继续使用同一个挂载中的空白会话，会把互不相关的创建合并成一个 Session；[Session 代次变更](../../../../docs/upgrade-guide/v0.2.1-alpha.1/new-session-generations/guide.zh.md)已经取消这一做法。交接草稿让每个新对话保持独立，同时把用户尚未发送的文字带到新位置。
++
+ ## 验证
+ 
+-数据模型的核心约束是：有效草稿经过导入、导出和 JSON 往返后语义相等，运行时节点 ID 不参与比较；初次获取输入对象即具有完整文档；选区和 skill 高亮变化不改变草稿快照。[文档模型用例](../../../../packages/client/ui-conversation/tests/draft-document.client.spec.ts)覆盖字符串、空稿、多行与 Unicode、文件／目录／Session 引用、重复引用、无效标记、占位字符净化和非法存储跨度；[输入生命周期用例](../../../../packages/client/ui-conversation/tests/draft-hub.client.spec.ts)验证首次读取、复用、词典服务到达／卸载／重连和旧 binding 失效。提交中拒绝初始化，词典重匹配不增加 Undo 步骤。
++数据模型的核心约束是：有效草稿经过导入、导出和 JSON 往返后语义相等，运行时节点 ID 不参与比较；初次获取输入对象即具有完整文档；选区和 skill 高亮变化不改变草稿快照。[文档模型用例](../../../../packages/client/ui-conversation/tests/draft-document.client.spec.ts)覆盖字符串、空稿、多行与 Unicode、文件／目录／Session 引用、重复引用、无效标记、占位字符净化和非法存储跨度；[输入生命周期用例](../../../../packages/client/ui-conversation/tests/draft-hub.client.spec.ts)验证首次读取、复用、词典服务到达／卸载／重连和旧 binding 失效，以及新对话交接的候选过滤、活动与已存来源、目标已有内容、存储拒绝和来源 key 清理。提交中拒绝初始化，词典重匹配不增加 Undo 步骤。
+ 
+-[导航用例](../../../../packages/client/ui-workspace/tests/workspaces-service.client.spec.ts)验证初始化作用于准确的保留对象、参数在异步创建前复制、导航取消不写稿、拒绝时保持原选择。[组合用例](../../../../packages/client/ui-conversation/tests/apply-inject.client.spec.tsx)验证现有工作区携带路径不把引用变成纯文本。相关回归共 44 个文件、708 项通过；共享草稿模块归位后，受影响的三个模型与组合文件再验证 66 项通过。
++[导航用例](../../../../packages/client/ui-workspace/tests/workspaces-service.client.spec.ts)验证初始化作用于准确的保留对象、参数在异步创建前复制、导航取消不写稿、拒绝时保持原选择，以及新对话交接的空白 Session 过滤。[组合用例](../../../../packages/client/ui-conversation/tests/apply-inject.client.spec.tsx)验证现有工作区携带路径不把引用变成纯文本。相关回归共 44 个文件、708 项通过；共享草稿模块归位后，受影响的三个模型与组合文件再验证 66 项通过。
+ 
+-[浏览器 e2e](../../../../apps/web/tests/draft-initialization.e2e.ts)通过已有模块加载观测方式取得实际 Workspace API，调用公开 `startSession` 传入文本选项，不新增测试插件。结构化 fixture 经既有已存草稿路径恢复。用例覆盖缺省、空字符串和非空提示词，明确传入及沿用当前工作区，保留与清空、创建与复用、真实界面的 Session 多轮切换和编辑、刷新、旧字符串及工作区选择器携带。延迟创建响应的两种返回顺序都保持较新的目标选择，并且不改动另一份草稿。延迟返回的真实 skill 目录只重匹配当前文字，不替换胶囊、选区或 Undo 历史。断言检查胶囊字段、文件预览和持久化快照。未点击发送前，Host 日志没有 `user/message` 或 `turn/start`。
++[浏览器 e2e](../../../../apps/web/tests/draft-initialization.e2e.ts)通过已有模块加载观测方式取得实际 Workspace API，调用公开 `startSession` 传入文本选项，不新增测试插件。结构化 fixture 经既有已存草稿路径恢复。用例覆盖缺省、空字符串和非空提示词，明确传入及沿用当前工作区，保留与清空、创建与复用、真实界面的 Session 多轮切换和编辑、刷新、旧字符串及工作区选择器携带；输入过的草稿（含 Unicode 文字与内联引用）会从被放弃的空白会话进入新的输入框。延迟创建响应的两种返回顺序都保持较新的目标选择，并且不改动另一份草稿。延迟返回的真实 skill 目录只重匹配当前文字，不替换胶囊、选区或 Undo 历史。断言检查胶囊字段、文件预览和持久化快照。未点击发送前，Host 日志没有 `user/message` 或 `turn/start`。
+ 
+ ## 后果与边界
+ 
+-旧字符串草稿缺失的引用信息不能无损推断，按普通文字恢复；不为兼容旧数据自动查询并猜测文件。附件文件对象、上传状态、跨浏览器同步、多个独立编辑器和完整 Undo 持久化不在本次范围。
++旧字符串草稿缺失的引用信息不能无损推断，按普通文字恢复；不为兼容旧数据自动查询并猜测文件。交接只移动文字和内联引用：附件留在被放弃的 Session 中，采用空白会话的文字不会带走其中已有的上传。附件文件对象、上传状态、跨浏览器同步、多个独立编辑器和完整 Undo 持久化不在本次范围。
+ 
+ 本决策与[编辑器隔离方案](../../proposed/architecture/2026-09-14-composer-model-and-draft-editor.zh.md)共享输入 owner 的归属，但不实现其多编辑器目标；[引用预览](../../../../packages/client/ui-input-trigger/README.zh.md)和[Session 引用生命周期](2026-09-15-client-session-references.zh.md)继续各自约束来源路由和代次清理，不被本次决策取代。
+diff --git a/apps/web/tests/draft-initialization.e2e.ts b/apps/web/tests/draft-initialization.e2e.ts
+index af536fa844..7859ffce1f 100644
+--- a/apps/web/tests/draft-initialization.e2e.ts
++++ b/apps/web/tests/draft-initialization.e2e.ts
+@@ -44,7 +44,7 @@ interface DraftOptions {
+ }
+ 
+ interface DraftApiObservation {
+-  startSession?: (workspaceId: string | undefined, options: DraftOptions) => void
++  startSession?: (workspaceId: string | undefined, options?: DraftOptions) => void
+ }
+ 
+ interface WorkspaceApplyContext {
+@@ -100,7 +100,7 @@ async function observeDraftApi(page: Page): Promise<void> {
+   })
+ }
+ 
+-async function startSession(page: Page, workspaceId: string | undefined, options: DraftOptions): Promise<void> {
++async function startSession(page: Page, workspaceId: string | undefined, options: DraftOptions | undefined): Promise<void> {
+   await page.evaluate(({ workspaceId, options }) => {
+     const observation = Reflect.get(globalThis, '__dshDraftApiObservation') as DraftApiObservation | undefined
+     if (observation?.startSession === undefined) throw new Error('The shipped Workspace apply has not been observed')
+@@ -597,6 +597,27 @@ it('carries all reference capsules through the real Workspace picker and leaves
+   expect(console.warnings).toEqual([])
+ })
+ 
++it('carries a typed draft from the blank a New Session abandons into the new composer', async () => {
++  const { scaffold, page, console, first, firstId } = await launchDraftFixture()
++  const draft: DraftSnapshot = { text: 'draft 未开始 🧭 e\u0301 雪', references: [] }
++  await expect.poll(() => storedDraft(page, firstId), SETTLE).toEqual(EMPTY)
++  await writeComposerDraft(page, composer(page), draft.text)
++  await expect.poll(() => storedDraft(page, firstId), SETTLE).toEqual(draft)
++
++  await startSession(page, undefined, undefined)
++  await expect.poll(() => first.sessionIds.length, SETTLE).toBe(2)
++  const nextId = first.sessionIds.find(id => id !== firstId)!
++  await assertDraft(page, nextId, draft)
++  expect([...first.sessionIds].sort()).toEqual([firstId, nextId].sort())
++  await expect.poll(() => storedDraft(page, firstId), SETTLE).toBeNull()
++
++  await page.reload({ waitUntil: 'load' })
++  await assertDraft(page, nextId, draft)
++  await assertUnsubmitted(scaffold, [firstId, nextId])
++  expect(console.pageErrors).toEqual([])
++  expect(console.warnings).toEqual([])
++})
++
+ it('applies a parameter transition matrix to one reusable target without changing another Workspace draft', async () => {
+   const { scaffold, page, console, first, firstId, second } = await launchDraftFixture()
+   const source = structuredDraft(firstId, '源草稿保持不变')
+diff --git a/packages/client/ui-conversation/README.i18n.yaml b/packages/client/ui-conversation/README.i18n.yaml
+index 3b74b55d70..b582dfbf77 100644
+--- a/packages/client/ui-conversation/README.i18n.yaml
++++ b/packages/client/ui-conversation/README.i18n.yaml
+@@ -21,8 +21,8 @@
+   en: 9912b286384c41d7
+   zh: 3e994887c1948677
+ /deepseek-ai-dsh-client-ui-conversation/shell-and-standard-props:
+-  en: c4d4aaef46daab72
+-  zh: 0dac50689d806ecf
++  en: 213b8d24447c7966
++  zh: cd45ab05dc628169
+ /deepseek-ai-dsh-client-ui-conversation/temporary-composer-entries:
+   en: bb1244310f5c0382
+   zh: 824b84077432b559
+diff --git a/packages/client/ui-conversation/README.md b/packages/client/ui-conversation/README.md
+index 1a0cb88bc9..c2a1388b1f 100644
+--- a/packages/client/ui-conversation/README.md
++++ b/packages/client/ui-conversation/README.md
+@@ -80,7 +80,7 @@ Drafts retain plain text and file, folder, and Session reference chips across Se
+ 
+ A claimed command is one atomic chip at the start of the draft, and the claim lasts exactly as long as that chip. Deleting the arguments and separator keeps the claim. At the chip's edge, the first Backspace or Delete selects the whole chip and the next one removes it and releases the claim, leaving the arguments as plain text; any other key, a click, or a caret move clears the selection. Text or a line break inserted before the chip turns it back into its literal token and releases the claim, and undo restores a deleted chip together with its claim. The persisted draft records the chip's token, so a reload rebuilds the chip once the command catalog resolves the claim; editing the draft first keeps the literal token, which Enter still submits as the command. The same rules apply to every command and locale, including `/goal`, `/目标`, `/plan`, and `/计划`. Command hints and ordinary placeholders remain hidden throughout IME composition and reappear only after the editor commits the final text and the corresponding input is empty.
+ 
+-Workspace selection uses `uiWorkspace.openWorkspace` to prepare the target and commit navigation. Draft content, including structured references, and attachments move in its synchronous preparation callback only while that request is current; later navigation or owner disposal leaves the original draft intact.
++Workspace selection uses `uiWorkspace.openWorkspace` to prepare the target and commit navigation. Draft content, including structured references, and attachments move in its synchronous preparation callback only while that request is current; later navigation or owner disposal leaves the original draft intact. A New Session that gets its own identity takes over the newest unsent draft of the blanks it abandons in that Workspace; the input owner saves the adopted draft under the new Session, empties a live source composer, and drops the source record, while attachments stay with their Session.
+ 
+ The package occupies the root-scoped `main` key `conversation`. Its `main.conversation` shell keeps the resident `conversation.header` outside the optional-Session `conversation.content` Component Factory. The header hosts root-scoped navigation without a selected Session; titles, actions, and View tabs remain in its strict Session child. The Factory owns the shared body and Composer, reads the current Session through its standard Hook, and exposes strict-Session `views` plus root-scoped `widthControls` local positions. Its default adapter renders the existing `conversation.session` entry, while the main occurrence selects the width handles; an embedded occurrence can replace `views` and omit those handles without rendering the main Header. The shared body and Composer register the queue and Todo docks. The Todo dock uses the shared panel elevation above the composer; its rows use the shared idle, ongoing, and done markers for pending, in-progress, and completed items. `ctx.uiSession.provide()` materializes the Conversation and input sources from the same Session binding and supplies `inputActions` as a stable standard prop.
+ 
+diff --git a/packages/client/ui-conversation/README.zh.md b/packages/client/ui-conversation/README.zh.md
+index ccef596924..a6d187db8f 100644
+--- a/packages/client/ui-conversation/README.zh.md
++++ b/packages/client/ui-conversation/README.zh.md
+@@ -80,7 +80,7 @@ Queue 预览启用空白折叠和文档边缘 trim，保留 emoji，并使用 CS
+ 
+ 已认领的命令是草稿开头的一个原子 chip，认领与该 chip 同生共灭。删除参数和分隔空格不影响认领。光标到达 chip 边缘时，第一次 Backspace 或 Delete 选中整个 chip，再按一次才删除它并释放认领，参数保留为普通文字；按其他键、点击或移动光标会取消选中。在 chip 前插入文字或换行会把它还原为字面 token 并释放认领，撤销会连同认领一起恢复被删除的 chip。持久化的草稿记录 chip 的 token，刷新后命令目录解析出认领即重建 chip；在此之前先编辑了草稿则保留字面 token，Enter 仍会把它作为命令提交。所有命令和语言使用相同规则，包括 `/goal`、`/目标`、`/plan` 和 `/计划`。输入法组合输入期间，命令提示和普通占位文字持续隐藏，直到编辑器提交最终文字且对应输入为空时才重新显示。
+ 
+-工作区选择使用 `uiWorkspace.openWorkspace` 准备目标并提交导航。草稿内容（包括结构化引用）和附件仅在该请求仍为当前请求时，通过它的同步准备回调搬移；后续导航或所有者释放会保留原草稿。
++工作区选择使用 `uiWorkspace.openWorkspace` 准备目标并提交导航。草稿内容（包括结构化引用）和附件仅在该请求仍为当前请求时，通过它的同步准备回调搬移；后续导航或所有者释放会保留原草稿。获得独立身份的新会话会接管其在该工作区中放弃的空白会话里最新的未发送草稿；输入所有者会把接管的草稿保存到新 Session 下、清空仍在挂载的源 composer，并删除源记录，附件仍留在各自的 Session。
+ 
+ 本包占据 root 作用域 `main` 中的 `conversation` key。其 `main.conversation` 外壳将常驻的 `conversation.header` 放在可选 Session 的 `conversation.content` Component Factory 外。未选中 Session 时，头部仍承载根作用域导航；标题、操作和 View 标签保留在严格 Session 子组件中。Factory 拥有共享正文与 Composer，通过其标准 Hook 读取当前 Session，并公开 strict-Session `views` 与 root-scoped `widthControls` 两个局部位置。默认 adapter 渲染现有 `conversation.session` entry，主 occurrence 选择宽度拖拽条；嵌入式 occurrence 可以替换 `views`、省略拖拽条，且不渲染主 Header。共享正文与 Composer 注册 queue dock 和 Todo dock。Todo dock 在 composer 上方使用共享面板 elevation；其中的行分别以共享 idle、ongoing 与 done 标记表示待处理、进行中与已完成。`ctx.uiSession.provide()` 从同一个 Session binding 物化 Conversation 与 input source，并将 `inputActions` 作为稳定标准 prop 提供。
+ 
+diff --git a/packages/client/ui-conversation/src/client/contract/input.ts b/packages/client/ui-conversation/src/client/contract/input.ts
+index 9b9502bf92..87aa2d0b4a 100644
+--- a/packages/client/ui-conversation/src/client/contract/input.ts
++++ b/packages/client/ui-conversation/src/client/contract/input.ts
+@@ -11,6 +11,7 @@ import type { SessionBinding } from '@deepseek-ai/dsh-api-session-controller/cli
+ import type { InboxState } from '@deepseek-ai/dsh-agent/types'
+ import type { ObservableSnapshot, SnapshotStore } from '@deepseek-ai/dsh-client-store'
+ import type { Branded } from '@deepseek-ai/dsh-brand'
++import type { SessionId } from '@deepseek-ai/dsh-session/types'
+ import type { ArbitrateKey, ArbitrateOutcome, Occurrence, ReferenceInsert, TokenSpan } from './draft-editor.ts'
+ import type { InputSubmitMode, MessageSubmission } from './composer-submission.ts'
+ 
+@@ -227,6 +228,20 @@ export interface SessionInputResolver {
+    * @throws when binding is not the currently retained Session generation.
+    */
+   requestDraftInitialization(binding: SessionBinding, options: DraftInitializationOptions): DraftInitializationResult
++  /**
++   * Move the first unsent draft among `sources` into a retained Session before
++   * navigation publishes it. A source holding text, reference chips, or a
++   * command token hands its content over, is emptied, and loses its saved
++   * draft; the adopted draft is saved under the target first, so a composer
++   * that mounts later restores it. Attachments stay with their Session
++   * because another Session cannot own their browser objects.
++   * @param sources - candidate Sessions in preference order.
++   * @param target - target Session generation, already retained by the caller.
++   * @returns applied, preserved when no source holds content or the target
++   * already holds content, or blocked by a pending submission or disposal.
++   * @throws when target is not the currently retained Session generation.
++   */
++  handOffDraft(sources: readonly SessionId[], target: SessionBinding): DraftInitializationResult
+ }
+ 
+ /** Initial text for a target Session; attachments remain under their existing owner. */
+diff --git a/packages/client/ui-conversation/src/client/draft.ts b/packages/client/ui-conversation/src/client/draft.ts
+index cc1c814f43..251e87c0dc 100644
+--- a/packages/client/ui-conversation/src/client/draft.ts
++++ b/packages/client/ui-conversation/src/client/draft.ts
+@@ -82,6 +82,15 @@ export function snapshotDraft(text: string, occurrences: readonly Occurrence[],
+   }
+ }
+ 
++/**
++ * Report whether a semantic draft holds content the user has not sent.
++ * @param draft - snapshot read from a live input or from browser storage.
++ * @returns true for text, reference chips, or a command token; attachments are owned separately.
++ */
++export function hasDraftContent(draft: DraftSnapshot): boolean {
++  return draft.text !== '' || draft.references.length > 0 || draft.command !== undefined
++}
++
+ function copyReference(reference: DraftReference): DraftReference {
+   return {
+     source: reference.source,
+diff --git a/packages/client/ui-conversation/src/client/input/facade.ts b/packages/client/ui-conversation/src/client/input/facade.ts
+index a0d772da71..e22c0f5116 100644
+--- a/packages/client/ui-conversation/src/client/input/facade.ts
++++ b/packages/client/ui-conversation/src/client/input/facade.ts
+@@ -639,6 +639,19 @@ export class SessionInputShell implements SessionInput {
+     }
+   }
+ 
++  /**
++   * Adopt another Session's unsent draft in place of an empty document.
++   * @param draft - unsent draft handed over from another Session.
++   * @returns applied when the document was replaced, preserved when this
++   * Session already holds content, or blocked after disposal or during a pending submission.
++   */
++  adoptDraft(draft: DraftSnapshot): DraftInitializationResult {
++    if (this.draftInitializationBlocked()) return 'blocked'
++    if (this.snapshot.draft !== '' || this.attachmentIds.length > 0) return 'preserved'
++    this.setDraft(draft)
++    return 'applied'
++  }
++
+   /**
+    * Bind the mounted composer's file action and live intake availability.
+    * @param picker - availability query and native file-dialog opener.
+diff --git a/packages/client/ui-conversation/src/client/input/hub.ts b/packages/client/ui-conversation/src/client/input/hub.ts
+index fb8d8a736f..aa1ca8134b 100644
+--- a/packages/client/ui-conversation/src/client/input/hub.ts
++++ b/packages/client/ui-conversation/src/client/input/hub.ts
+@@ -25,7 +25,8 @@ import type { InputSubmitMode } from '../contract/composer-submission.ts'
+ import type { PopupDismissFace } from './facade.ts'
+ import { SessionInputShell } from './facade.ts'
+ import { reportMessageSubmission } from './submission-analytics.ts'
+-import { readConversationDraft } from '../stores.ts'
++import { clearConversationDraft, readConversationDraft, writeConversationDraft } from '../stores.ts'
++import { hasDraftContent } from '../draft.ts'
+ 
+ /** Structural command face for per-session popup resolution. */
+ interface CommandFace {
+@@ -86,6 +87,37 @@ export class InputHub implements SessionInputResolver {
+     return this.shellFor(binding).requestDraftInitialization(options)
+   }
+ 
++  handOffDraft(sources: readonly SessionId[], target: SessionBinding): DraftInitializationResult {
++    if (this.sessions().binding(target.sessionId) !== target) {
++      throw new Error('conversation.input.handOffDraft requires a retained Session binding')
++    }
++    for (const source of sources) {
++      if (source === target.sessionId) continue
++      const live = this.liveShell(source)
++      const draft = live === undefined ? readConversationDraft(source) : live.draftSnapshot
++      if (!hasDraftContent(draft)) continue
++      const targetShell = this.shellFor(target)
++      const result = targetShell.adoptDraft(draft)
++      if (result !== 'applied') return result
++      // The target composer mounts after this navigation; record the draft before dropping its source.
++      if (!writeConversationDraft(target.sessionId, targetShell.draftSnapshot)) return 'applied'
++      live?.setDraft('')
++      clearConversationDraft(source)
++      return 'applied'
++    }
++    return 'preserved'
++  }
++
++  /**
++   * The mounted composer of a Session, while its binding is retained.
++   * @param sessionId - Session to inspect.
++   * @returns the live shell, or undefined when it is unretained or unmounted.
++   */
++  private liveShell(sessionId: SessionId): SessionInputShell | undefined {
++    const binding = this.sessions().binding(sessionId)
++    return binding === undefined ? undefined : this.shells.get(binding)
++  }
++
+   /**
+    * Resolve the resident shell for an already-retained, addressable Session binding.
+    * Draft import completes before return. The Session scope owns input listeners,
+diff --git a/packages/client/ui-conversation/src/client/stores.ts b/packages/client/ui-conversation/src/client/stores.ts
+index 34e4261a26..fba7c50bb1 100644
+--- a/packages/client/ui-conversation/src/client/stores.ts
++++ b/packages/client/ui-conversation/src/client/stores.ts
+@@ -55,6 +55,42 @@ export function readConversationDraft(sessionId: SessionId): DraftSnapshot {
+   }
+ }
+ 
++/**
++ * Remove the saved draft of one Session from browser storage.
++ * A storage that is absent or refuses removal keeps its saved record.
++ * @param sessionId - Session whose saved draft is dropped.
++ */
++export function clearConversationDraft(sessionId: SessionId): void {
++  if (typeof localStorage === 'undefined') return
++  try {
++    localStorage.removeItem(`${CONVERSATION_STORE_KEY}.${sessionId}`)
++  } catch (_error: unknown) {
++    // Unavailable browser storage holds no saved draft to drop.
++  }
++}
++
++/**
++ * Save a Session's unsent draft under its persistence key without disturbing
++ * the View preference stored beside it.
++ * @param sessionId - Session whose draft is saved.
++ * @param draft - semantic draft to save.
++ * @returns true when browser storage accepted the record.
++ */
++export function writeConversationDraft(sessionId: SessionId, draft: DraftSnapshot): boolean {
++  if (typeof localStorage === 'undefined') return false
++  try {
++    const key = `${CONVERSATION_STORE_KEY}.${sessionId}`
++    const raw = localStorage.getItem(key)
++    const stored: unknown = raw === null ? undefined : JSON.parse(raw)
++    const record = typeof stored === 'object' && stored !== null ? stored : { view: null, viewRequest: null }
++    localStorage.setItem(key, JSON.stringify({ ...record, draft }))
++    return true
++  } catch (_error: unknown) {
++    // Unavailable browser storage keeps the draft only in the composer that adopted it.
++    return false
++  }
++}
++
+ /**
+  * Read the persisted View preference before the Slot store is materialized.
+  * @param sessionId - Session-scoped persistence suffix.
+diff --git a/packages/client/ui-conversation/tests/conversation-store.client.spec.ts b/packages/client/ui-conversation/tests/conversation-store.client.spec.ts
+index 6b01857c86..23d596aa51 100644
+--- a/packages/client/ui-conversation/tests/conversation-store.client.spec.ts
++++ b/packages/client/ui-conversation/tests/conversation-store.client.spec.ts
+@@ -2,7 +2,10 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import type { SessionId } from '@deepseek-ai/dsh-session/types'
+ import type { DraftSnapshot } from '../src/client/contract/draft-editor.ts'
+-import { createConversationStore, readConversationDraft, readConversationViewPreference } from '../src/client/stores.ts'
++import {
++  clearConversationDraft, createConversationStore, readConversationDraft, readConversationViewPreference,
++  writeConversationDraft,
++} from '../src/client/stores.ts'
+ 
+ const KEY = 'dsh.conversation'
+ 
+@@ -150,6 +153,77 @@ describe('createConversationStore', () => {
+     } finally { vi.unstubAllGlobals() }
+   })
+ 
++  it('drops the saved record of one Session and leaves the others', () => {
++    localStorage.setItem(`${KEY}.dropped`, JSON.stringify({ draft: 'unsent', view: 'chat' }))
++    localStorage.setItem(`${KEY}.kept`, JSON.stringify({ draft: 'unsent', view: 'chat' }))
++
++    clearConversationDraft('dropped' as SessionId)
++
++    expect(localStorage.getItem(`${KEY}.dropped`)).toBeNull()
++    expect(readConversationDraft('kept' as SessionId)).toEqual({ text: 'unsent', references: [] })
++  })
++
++  it('drops no saved record when browser storage is absent', () => {
++    vi.stubGlobal('localStorage', undefined)
++    try {
++      expect(() => { clearConversationDraft('unavailable' as SessionId) }).not.toThrow()
++    } finally { vi.unstubAllGlobals() }
++  })
++
++  it('keeps the saved record when browser storage denies removal', () => {
++    localStorage.setItem(`${KEY}.denied`, JSON.stringify({ draft: 'unsent', view: null }))
++    const remove = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
++      throw new DOMException('Storage access denied', 'SecurityError')
++    })
++    try {
++      expect(() => { clearConversationDraft('denied' as SessionId) }).not.toThrow()
++      expect(remove).toHaveBeenCalledExactlyOnceWith(`${KEY}.denied`)
++    } finally { remove.mockRestore() }
++  })
++
++  it('saves a draft beside the stored View preference', () => {
++    localStorage.setItem(`${KEY}.saved`, JSON.stringify({ draft: 'before', view: 'trajectory', viewRequest: null }))
++
++    expect(writeConversationDraft('saved' as SessionId, { text: 'after', references: [] })).toBe(true)
++
++    expect(readConversationDraft('saved' as SessionId)).toEqual({ text: 'after', references: [] })
++    expect(readConversationViewPreference('saved' as SessionId)).toBe('trajectory')
++  })
++
++  it('saves a draft for a Session without a stored View preference', () => {
++    expect(writeConversationDraft('fresh' as SessionId, { text: 'unsent', references: [] })).toBe(true)
++
++    expect(readConversationDraft('fresh' as SessionId)).toEqual({ text: 'unsent', references: [] })
++    expect(readConversationViewPreference('fresh' as SessionId)).toBeNull()
++  })
++
++  it('replaces an unusable saved record with the draft', () => {
++    for (const raw of ['"legacy text"', 'null']) {
++      localStorage.setItem(`${KEY}.broken`, raw)
++
++      expect(writeConversationDraft('broken' as SessionId, { text: 'unsent', references: [] })).toBe(true)
++
++      expect(readConversationDraft('broken' as SessionId)).toEqual({ text: 'unsent', references: [] })
++    }
++  })
++
++  it('reports an unsaved draft when browser storage is absent', () => {
++    vi.stubGlobal('localStorage', undefined)
++    try {
++      expect(writeConversationDraft('unavailable' as SessionId, { text: 'unsent', references: [] })).toBe(false)
++    } finally { vi.unstubAllGlobals() }
++  })
++
++  it('reports an unsaved draft when browser storage denies the write', () => {
++    const set = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
++      throw new DOMException('Storage access denied', 'SecurityError')
++    })
++    try {
++      expect(writeConversationDraft('denied' as SessionId, { text: 'unsent', references: [] })).toBe(false)
++      expect(set).toHaveBeenCalledOnce()
++    } finally { set.mockRestore() }
++  })
++
+   it('returns empty preferences when browser storage denies access', () => {
+     const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+       throw new DOMException('Storage access denied', 'SecurityError')
+diff --git a/packages/client/ui-conversation/tests/draft-hub.client.spec.ts b/packages/client/ui-conversation/tests/draft-hub.client.spec.ts
+index 3bb9f130ec..dbe3e0619f 100644
+--- a/packages/client/ui-conversation/tests/draft-hub.client.spec.ts
++++ b/packages/client/ui-conversation/tests/draft-hub.client.spec.ts
+@@ -14,6 +14,7 @@ import { ReferenceChipNode } from '../src/client/input/editor/chip-node.tsx'
+ import { TextRefNode } from '../src/client/input/editor/text-ref.ts'
+ import { SessionInputShell } from '../src/client/input/facade.ts'
+ import { InputHub } from '../src/client/input/hub.ts'
++import { readConversationDraft } from '../src/client/stores.ts'
+ import { zh } from '../src/client/locales.ts'
+ 
+ const mention = '@src/main.ts'
+@@ -56,6 +57,40 @@ async function fixture(draft: unknown) {
+   return { ...b, shell: b.hub.shellFor(b.binding) }
+ }
+ 
++/** Two Sessions under one Hub: an abandoned blank and the Session a navigation opens. */
++async function handOffBench() {
++  const emptyId = SessionId(`draft-handoff-empty-${randomUUID()}`)
++  const sourceId = SessionId(`draft-handoff-source-${randomUUID()}`)
++  const targetId = SessionId(`draft-handoff-target-${randomUUID()}`)
++  const keys = {
++    empty: `dsh.conversation.${emptyId}`, source: `dsh.conversation.${sourceId}`, target: `dsh.conversation.${targetId}`,
++  }
++  const previous = Object.values(keys).map(key => [key, localStorage.getItem(key)] as const)
++  onTestFinished(() => {
++    for (const [key, raw] of previous) {
++      if (raw === null) localStorage.removeItem(key)
++      else localStorage.setItem(key, raw)
++    }
++  })
++  const ctx = new Context()
++  const sessions = new TestSessions(async (operation) => { await operation() }, ctx)
++  onTestFinished(async () => {
++    await sessions.disposeScopes()
++    await ctx.fiber.dispose()
++  })
++  ctx.provide('sessions', sessions)
++  for (const id of [emptyId, sourceId, targetId]) await sessions.add({ id })
++  const target = sessions.retain(targetId)
++  onTestFinished(() => { target.release() })
++  await target.ready
++  const hub = new InputHub(ctx, makeTranslate(zh, {}))
++  return { ctx, sessions, hub, target, binding: target.binding, emptyId, sourceId, targetId, keys }
++}
++
++function storeDraft(key: string, draft: DraftSnapshot): void {
++  localStorage.setItem(key, JSON.stringify({ draft, view: 'trajectory', viewRequest: null }))
++}
++
+ function textReferences(shell: SessionInputShell): string[] {
+   return shell.editor.getEditorState().read(() => $nodesOfType(TextRefNode).map(node => node.getTextContent()))
+ }
+@@ -308,3 +343,109 @@ it('unsubscribes the lexicon and refuses the old binding after Session disposal'
+   expect(b.shell.requestDraftInitialization({ prompt: 'late edit', clearPreviousDraft: true })).toBe('blocked')
+   expect(() => b.hub.requestDraftInitialization(b.binding, { prompt: 'late edit' })).toThrow('retained Session binding')
+ })
++
++it('moves a saved draft from an abandoned Session to the opened one and drops the source key', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.source, saved)
++  const targetShell = b.hub.shellFor(b.binding)
++
++  expect(b.hub.handOffDraft([b.sourceId], b.binding)).toBe('applied')
++
++  expect(targetShell.draftSnapshot).toEqual(saved)
++  expect(targetShell.editor.getEditorState().read(() => $nodesOfType(ReferenceChipNode).length)).toBe(1)
++  expect(readConversationDraft(b.targetId)).toEqual(saved)
++  expect(localStorage.getItem(b.keys.source)).toBeNull()
++})
++
++it('keeps the source saved draft when the opened Session record cannot be written', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.source, saved)
++  const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
++    throw new DOMException('Storage access denied', 'SecurityError')
++  })
++  onTestFinished(() => { setItem.mockRestore() })
++
++  expect(b.hub.handOffDraft([b.sourceId], b.binding)).toBe('applied')
++
++  expect(b.hub.shellFor(b.binding).draftSnapshot).toEqual(saved)
++  expect(localStorage.getItem(b.keys.source)).not.toBeNull()
++})
++
++it('skips candidates without an unsent draft and adopts the first one that holds a draft', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.empty, { text: '', references: [] })
++  storeDraft(b.keys.source, saved)
++  const targetShell = b.hub.shellFor(b.binding)
++
++  expect(b.hub.handOffDraft([SessionId('draft-handoff-missing'), b.emptyId, b.sourceId], b.binding)).toBe('applied')
++
++  expect(targetShell.draftSnapshot).toEqual(saved)
++  expect(localStorage.getItem(b.keys.empty)).not.toBeNull()
++  expect(localStorage.getItem(b.keys.source)).toBeNull()
++})
++
++it('keeps both drafts when the opened Session already holds content', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.source, saved)
++  const targetShell = b.hub.shellFor(b.binding)
++  targetShell.setDraft('already typing')
++
++  expect(b.hub.handOffDraft([b.sourceId], b.binding)).toBe('preserved')
++
++  expect(targetShell.draftSnapshot).toEqual({ text: 'already typing', references: [] })
++  expect(localStorage.getItem(b.keys.source)).not.toBeNull()
++})
++
++it('reports preserved when no candidate holds an unsent draft', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.empty, { text: '', references: [] })
++
++  expect(b.hub.handOffDraft([], b.binding)).toBe('preserved')
++  expect(b.hub.handOffDraft([b.emptyId], b.binding)).toBe('preserved')
++
++  expect(localStorage.getItem(b.keys.empty)).not.toBeNull()
++})
++
++it('empties a mounted source composer before dropping its saved draft', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.source, saved)
++  const source = b.sessions.retain(b.sourceId)
++  onTestFinished(() => { source.release() })
++  await source.ready
++  const sourceShell = b.hub.shellFor(source.binding)
++  sourceShell.setDraft('typed in the abandoned blank')
++
++  expect(b.hub.handOffDraft([b.sourceId], b.binding)).toBe('applied')
++
++  expect(sourceShell.draftSnapshot).toEqual({ text: '', references: [] })
++  expect(b.hub.shellFor(b.binding).draftSnapshot).toEqual({ text: 'typed in the abandoned blank', references: [] })
++  expect(localStorage.getItem(b.keys.source)).toBeNull()
++})
++
++it('skips the opened Session when it appears among its own draft sources', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.source, saved)
++
++  expect(b.hub.handOffDraft([b.targetId, b.sourceId], b.binding)).toBe('applied')
++
++  expect(b.hub.shellFor(b.binding).draftSnapshot).toEqual(saved)
++})
++
++it('leaves the source draft in place when the opened composer cannot accept it', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.source, saved)
++  b.hub.shellFor(b.binding).dispose()
++
++  expect(b.hub.handOffDraft([b.sourceId], b.binding)).toBe('blocked')
++
++  expect(localStorage.getItem(b.keys.source)).not.toBeNull()
++})
++
++it('refuses a draft hand-off to a Session binding that is no longer retained', async () => {
++  const b = await handOffBench()
++  storeDraft(b.keys.source, saved)
++  b.target.release()
++
++  expect(() => b.hub.handOffDraft([b.sourceId], b.binding)).toThrow('retained Session binding')
++  expect(localStorage.getItem(b.keys.source)).not.toBeNull()
++})
+diff --git a/packages/client/ui-workspace/README.i18n.yaml b/packages/client/ui-workspace/README.i18n.yaml
+index 60a03011cf..af45ebfb8d 100644
+--- a/packages/client/ui-workspace/README.i18n.yaml
++++ b/packages/client/ui-workspace/README.i18n.yaml
+@@ -33,11 +33,11 @@
+   en: 9fb88260380bf093
+   zh: 3bace2b96ecd4a82
+ /deepseek-ai-dsh-client-ui-workspace/use-this-package/active-schedule-markers:
+-  en: 8d82539e4e4e890d
+-  zh: 7b97a3927de90ea8
++  en: 084de049c9f8f601
++  zh: dd8085706f2262cd
+ /deepseek-ai-dsh-client-ui-workspace/understand-the-implementation:
+-  en: 721d5a49fe231191
+-  zh: 3ef1dd720219e00e
++  en: 8b9690ceeb6661f2
++  zh: 8931e98d87aabf79
+ /deepseek-ai-dsh-client-ui-workspace/understand-the-implementation/the-directory-flow-hole:
+   en: 868904dbfb5713f8
+   zh: 225906bfef7398bf
+diff --git a/packages/client/ui-workspace/README.md b/packages/client/ui-workspace/README.md
+index 2654447b77..62b28554e6 100644
+--- a/packages/client/ui-workspace/README.md
++++ b/packages/client/ui-workspace/README.md
+@@ -71,7 +71,7 @@ Grouped and flat Session rows show a clock mark when the Session has active sche
+ 
+ -----
+ 
+-`ctx.uiWorkspace.openSession(target)` synchronously replaces the owned `mainView` reference and returns the main area to Conversation without waiting for `reference.ready`, so history loading renders inside the selected Session view. The target may be a known Session id or a durable direct-parent subagent address; an explicit address does not require a preloaded parent catalog. `openWorkspace(id, beforeOpen?, options?)` opens a Workspace blank only if no later navigation has superseded the request; an explicit New Session creates a fresh Session. `forkSession(id)` creates the child without navigating or superseding a pending navigation. The optional synchronous preparation callback runs after the target is retained and only for a current Workspace request, so superseded requests do not move composer drafts. Navigation or owner disposal suppresses the late UI commit, not the underlying Session creation. Startup restoration retains its main reference without changing the selected panel or cancelling a later navigation. Archiving the main Session releases its reference and clears the main selection. Selection failure leaves a global panel visible. Session rows read `usePanelInfo` to suppress their selected appearance while a global panel is active; search and directory-picker focus alone do not leave that panel.
++`ctx.uiWorkspace.openSession(target)` synchronously replaces the owned `mainView` reference and returns the main area to Conversation without waiting for `reference.ready`, so history loading renders inside the selected Session view. The target may be a known Session id or a durable direct-parent subagent address; an explicit address does not require a preloaded parent catalog. `openWorkspace(id, beforeOpen?, options?)` opens a Workspace blank only if no later navigation has superseded the request; an explicit New Session creates a fresh Session. An opened New Session takes the composer draft of the newest eligible blank in that Workspace other than itself: text and inline references move into the opened Session, attachments stay with their blank, and that blank's saved draft record is dropped while its row keeps its place. `forkSession(id)` creates the child without navigating or superseding a pending navigation. The optional synchronous preparation callback runs after the target is retained and only for a current Workspace request, so superseded requests do not move composer drafts. Navigation or owner disposal suppresses the late UI commit, not the underlying Session creation. Startup restoration retains its main reference without changing the selected panel or cancelling a later navigation. Archiving the main Session releases its reference and clears the main selection. Selection failure leaves a global panel visible. Session rows read `usePanelInfo` to suppress their selected appearance while a global panel is active; search and directory-picker focus alone do not leave that panel.
+ 
+ Navigation and startup restoration obtain the selected Session's projections from its `follow`; neither issues a separate projection refresh for that Session or its parent, except that restoring a saved blank first reloads that Session's projections, because listed values are cached hints that can lag its log after an unclean Host exit.
+ 
+@@ -93,7 +93,7 @@ The package is one composition: both target slots are declared by other plugins,
+ 
+ The browser entry also declares two root-scoped `list` child seats on each Session row: `sidebar.session.row.leading`, rendered only while that row's primary status is idle and left blank on an archived row, and `sidebar.session.row.hover`, mounted only while that row's hover card is open. Both take the row's Session identity and nothing else, so an occupant reads its own data by that id; a Session-scoped seat would force a Session binding, which would activate and retain every listed Session.
+ 
+-Client callers can pass `prompt` and `clearPreviousDraft` in the second argument to `uiWorkspace.startSession`. A prompt is plain text; structured drafts are handled internally during restoration and Workspace transfer. Without clearing, existing text or attachments are preserved; explicit clearing replaces only the target Session's text and inline references, leaving attachments intact. Option values are captured before asynchronous creation and applied to the exact retained binding before navigation commits. Superseded navigation does not write content; a submission-blocked input refuses preparation and keeps the previous selection. Calls without options create a fresh Session using the current Agent preset definition. Workspace reconnection and explicit draft preparation may reuse an existing blank Session. The [draft initialization decision](../../../.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.md) describes the input owner's data flow.
++Client callers can pass `prompt` and `clearPreviousDraft` in the second argument to `uiWorkspace.startSession`. A prompt is plain text; structured drafts are handled internally during restoration and Workspace transfer. Without clearing, existing text or attachments are preserved; explicit clearing replaces only the target Session's text and inline references, leaving attachments intact. Option values are captured before asynchronous creation and applied to the exact retained binding before navigation commits. Superseded navigation does not write content; a submission-blocked input refuses preparation and keeps the previous selection. Calls without options create a fresh Session using the current Agent preset definition, and that Session takes over the newest eligible blank's unsent draft in the Workspace, so a typed but unstarted draft survives the New Session action. Workspace reconnection and explicit draft preparation may reuse an existing blank Session. The [draft initialization decision](../../../.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.md) describes the input owner's data flow.
+ 
+ ### The directory-flow hole
+ 
+diff --git a/packages/client/ui-workspace/README.zh.md b/packages/client/ui-workspace/README.zh.md
+index c655995453..a1e504e951 100644
+--- a/packages/client/ui-workspace/README.zh.md
++++ b/packages/client/ui-workspace/README.zh.md
+@@ -71,7 +71,7 @@ Session 行渲染运行时的实时 `pendingInteraction` 分类：审批显示**
+ 
+ -----
+ 
+-`ctx.uiWorkspace.openSession(target)` 会同步替换其拥有的 `mainView` reference，并让主区域返回 Conversation，而不等待 `reference.ready`，因此历史加载会显示在已经选中的 Session 视图内。目标可以是已知 Session id，也可以是持久的直接父子 subagent 地址；显式地址不要求预先加载 parent catalog。`openWorkspace(id, beforeOpen?, options?)` 仅在请求未被后续导航替代时打开工作区空白 Session；显式新会话操作会创建新的 Session。`forkSession(id)` 创建子会话，不导航，也不替代尚未完成的导航。可选的同步准备回调在目标被 retain 后执行，并且仅对仍有效的 Workspace 请求执行，因此过期请求不会搬移 composer 草稿。后续导航或 owner 释放会阻止晚到的 UI 提交，但不取消底层 Session 创建。启动恢复会 retain 主 reference，不改变已选面板，也不取消后续导航。归档主 Session 会释放其 reference 并清除主选择。选择失败时保留当前全局面板。Session 行读取 `usePanelInfo`，在全局面板活跃时不显示 Session 选中样式；仅把焦点移到搜索框或目录选择器不会离开该面板。
++`ctx.uiWorkspace.openSession(target)` 会同步替换其拥有的 `mainView` reference，并让主区域返回 Conversation，而不等待 `reference.ready`，因此历史加载会显示在已经选中的 Session 视图内。目标可以是已知 Session id，也可以是持久的直接父子 subagent 地址；显式地址不要求预先加载 parent catalog。`openWorkspace(id, beforeOpen?, options?)` 仅在请求未被后续导航替代时打开工作区空白 Session；显式新会话操作会创建新的 Session。打开的新会话会接管该工作区中最新的符合条件的空白会话（自身除外）的 composer 草稿：文字和内联引用移入打开的新会话，附件留在原空白会话，该空白会话保存的草稿记录被删除，但其行位置保留。`forkSession(id)` 创建子会话，不导航，也不替代尚未完成的导航。可选的同步准备回调在目标被 retain 后执行，并且仅对仍有效的 Workspace 请求执行，因此过期请求不会搬移 composer 草稿。后续导航或 owner 释放会阻止晚到的 UI 提交，但不取消底层 Session 创建。启动恢复会 retain 主 reference，不改变已选面板，也不取消后续导航。归档主 Session 会释放其 reference 并清除主选择。选择失败时保留当前全局面板。Session 行读取 `usePanelInfo`，在全局面板活跃时不显示 Session 选中样式；仅把焦点移到搜索框或目录选择器不会离开该面板。
+ 
+ 导航和启动恢复通过所选 Session 的 `follow` 获取投影，不会另行刷新该 Session 或其父会话的投影；例外是恢复已保存的空白会话时先重新加载该 Session 的投影，因为列表中的值是缓存提示，Host 非正常退出后可能落后于其日志。
+ 
+@@ -93,7 +93,7 @@ Workspace 和 Session 的启动基线均就绪后，空安装环境调用 `works
+ 
+ 浏览器入口还为每个 Session 行声明两个 root 作用域的 `list` 子 slot：`sidebar.session.row.leading` 仅在该行主状态为 idle 时渲染、归档行留空，`sidebar.session.row.hover` 仅在该行的悬浮卡片打开时挂载。两者只接收行的 Session 身份，占用方据此读取自己的数据；Session 作用域的 slot 会强制建立 Session 绑定，从而激活并保留列表中每个 Session。
+ 
+-客户端调用方可以在 `uiWorkspace.startSession` 的第二参数中传入 `prompt` 与 `clearPreviousDraft`。提示词仅接受普通文字；结构化草稿由内部恢复和工作区携带流程处理。不清空时保留已有文字或附件；显式清空只替换目标 Session 的文字和内联引用，不删除附件。在异步创建前捕获选项值，在导航提交前应用到准确保留的 binding。已被后续操作取代的导航不写内容；输入处于提交阻塞状态时拒绝准备并保留原选择。不传选项时按当前 Agent 预设定义创建新的 Session。工作区重连和显式草稿准备仍可复用已有空 Session。[草稿初始化决策](../../../.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.zh.md)说明输入 owner 的数据流。
++客户端调用方可以在 `uiWorkspace.startSession` 的第二参数中传入 `prompt` 与 `clearPreviousDraft`。提示词仅接受普通文字；结构化草稿由内部恢复和工作区携带流程处理。不清空时保留已有文字或附件；显式清空只替换目标 Session 的文字和内联引用，不删除附件。在异步创建前捕获选项值，在导航提交前应用到准确保留的 binding。已被后续操作取代的导航不写内容；输入处于提交阻塞状态时拒绝准备并保留原选择。不传选项时按当前 Agent 预设定义创建新的 Session，该 Session 会接管工作区中最新的符合条件的空白会话的未发送草稿，因此已经输入但尚未开始的草稿能挺过新建会话操作。工作区重连和显式草稿准备仍可复用已有空 Session。[草稿初始化决策](../../../.agents/notes/implemented/architecture/2026-09-30-structured-draft-initialization.zh.md)说明输入 owner 的数据流。
+ 
+ ### 目录流子 slot
+ 
+diff --git a/packages/client/ui-workspace/src/client/navigation.ts b/packages/client/ui-workspace/src/client/navigation.ts
+index 9c8fa97760..9a1a171afc 100644
+--- a/packages/client/ui-workspace/src/client/navigation.ts
++++ b/packages/client/ui-workspace/src/client/navigation.ts
+@@ -7,6 +7,7 @@ import type {
+   SessionCreateError,
+   SessionBinding,
+   SessionReference,
++  SessionSummary,
+   SessionTarget,
+   SessionListState,
+ } from '@deepseek-ai/dsh-api-session-controller/client'
+@@ -44,6 +45,9 @@ export interface UiWorkspace {
+   openSession(target: SessionTarget): void
+   /**
+    * Connect a Workspace and open its Session unless a later navigation supersedes it.
++   * The opened Session takes over the newest unsent draft of the blanks in that
++   * Workspace other than itself: text and inline references move, attachments stay
++   * with their blank, and that blank's saved draft is dropped.
+    * @param workspaceId - target Workspace.
+    * @param beforeOpen - optional synchronous preparation for the selected Session,
+    * skipped after supersession; a throw aborts the open and releases the retained reference.
+@@ -79,8 +83,10 @@ export interface UiWorkspace {
+    */
+   connectWorkspace(workspaceId: WorkspaceId, options?: Pick<StartSessionOptions, 'agentPreset'>): Promise<SessionId>
+   /**
+-   * Create a fresh Session, or reuse a blank when preparing an explicit draft. A creation the Host
+-   * refuses is shown through the Workspace notice and leaves the selection as it was.
++   * Create a fresh Session, or reuse a blank when preparing an explicit draft. The
++   * Session it opens takes over the newest unsent draft of a blank Session it
++   * abandons in the same Workspace. A creation the Host refuses is shown through the Workspace
++   * notice and leaves the selection as it was.
+    * @param workspaceId - explicit target; absent inherits the current or most recent Workspace.
+    * @param options - initial content and the reused blank's preset; existing text or attachments
+    * are preserved unless clearPreviousDraft is true.
+@@ -222,8 +228,7 @@ class UiWorkspaceService extends Service implements UiWorkspace {
+     const sessions = this.sessions.list.getSnapshot()
+     const blank = sessions.ids.find((id) => {
+       const summary = sessions.byId[id]
+-      return summary !== undefined && summary.blank && summary.cwd === workspace.path
+-        && workspace.sessionIds.includes(id) && !archived.includes(id)
++      return summary !== undefined && this.reusableBlank(workspace, summary, archived)
+     })
+     return this.createNamed({
+       workspaceId: workspace.workspaceId,
+@@ -232,6 +237,19 @@ class UiWorkspaceService extends Service implements UiWorkspace {
+     })
+   }
+ 
++  /**
++   * Whether a listed Session is a blank member the Host may reopen instead of
++   * creating one: blank, unarchived, in `workspace`, and living at its directory.
++   */
++  private reusableBlank(
++    workspace: WorkspaceView,
++    session: SessionSummary,
++    archived: readonly SessionId[],
++  ): boolean {
++    return session.blank && session.cwd === workspace.path
++      && workspace.sessionIds.includes(session.id) && !archived.includes(session.id)
++  }
++
+   /**
+    * Create through the Host. A named blank the Host declined may still read as
+    * blank from stale cached list metadata, which hides it from the Session tree;
+@@ -301,7 +319,10 @@ class UiWorkspaceService extends Service implements UiWorkspace {
+       throw error
+     }
+     if (navigation.aborted) return
+-    this.replaceMain(sessionId, navigation, 'reveal', beforeOpen)
++    this.replaceMain(sessionId, navigation, 'reveal', (id) => {
++      beforeOpen?.(id)
++      this.handOffAbandonedDraft(workspaceId, id)
++    })
+   }
+ 
+   async forkSession(
+@@ -364,6 +385,39 @@ class UiWorkspaceService extends Service implements UiWorkspace {
+     throw new Error(message)
+   }
+ 
++  /**
++   * Move an unsent draft out of the blanks this open abandons.
++   * A created Session gets its own id, so a draft left in the mounted blank would
++   * otherwise stay behind that blank's persistence key and never reach the new
++   * composer. Every eligible blank in the Workspace is offered to the Session
++   * input, newest first.
++   */
++  private handOffAbandonedDraft(workspaceId: WorkspaceId, target: SessionId): void {
++    const conversation = this.ctx.get('conversation')
++    if (conversation === undefined) return
++    const workspace = this.workspaces.list.getSnapshot().items
++      .find(item => item.workspaceId === workspaceId)
++    if (workspace === undefined) return
++    const sources = this.abandonedBlanks(workspace, target)
++    const binding = sources.length === 0 ? undefined : this.sessions.binding(target)
++    if (binding === undefined) return
++    conversation.input.handOffDraft(sources, binding)
++  }
++
++  /**
++   * Blanks in `workspace` other than `target`, most recently updated first.
++   * @param workspace - Workspace the open joins.
++   * @param target - the opened Session, which is never its own draft source.
++   */
++  private abandonedBlanks(workspace: WorkspaceView, target: SessionId): readonly SessionId[] {
++    const sessions = this.sessions.list.getSnapshot()
++    const archived = this.workspaces.list.getSnapshot().archivedSessionIds
++    return Object.values(sessions.byId)
++      .filter(summary => summary.id !== target && this.reusableBlank(workspace, summary, archived))
++      .sort((left, right) => right.updatedAt - left.updatedAt)
++      .map(summary => summary.id)
++  }
++
+   async archiveSession(sessionId: SessionId, options: { readonly stopActivity?: boolean } = {}): Promise<void> {
+     await this.workspaces.archiveSession(sessionId, options)
+     if (this.mainReference?.sessionId === sessionId) this.clearMain()
+diff --git a/packages/client/ui-workspace/tests/workspaces-service.client.spec.ts b/packages/client/ui-workspace/tests/workspaces-service.client.spec.ts
+index 1662c1cd5f..97bf94bbd2 100644
+--- a/packages/client/ui-workspace/tests/workspaces-service.client.spec.ts
++++ b/packages/client/ui-workspace/tests/workspaces-service.client.spec.ts
+@@ -286,7 +286,8 @@ function bench(options: BenchOptions = {}) {
+   ctx.effect(() => locale.register('workspace', { en, zh }))
+   ctx.provide('locale', locale)
+   const requestDraftInitialization = vi.fn<SessionInputResolver['requestDraftInitialization']>(() => 'applied')
+-  if (options.conversation !== false) ctx.provide('conversation', { input: { requestDraftInitialization } })
++  const handOffDraft = vi.fn<SessionInputResolver['handOffDraft']>(() => 'preserved')
++  if (options.conversation !== false) ctx.provide('conversation', { input: { requestDraftInitialization, handOffDraft } })
+   const layout = new LayoutController({
+     selectPanel: vi.fn(), retainMainPanels: vi.fn(),
+     setSidebar: vi.fn(), toggleSidebar: vi.fn(), setViewportWidth: vi.fn(),
+@@ -310,7 +311,10 @@ function bench(options: BenchOptions = {}) {
+     view.actions,
+     notify,
+   )
+-  return { ctx, directoryPicker, sessions, uiWorkspace, workspaces, layout, selectPanel, view, notify, requestDraftInitialization }
++  return {
++    ctx, directoryPicker, sessions, uiWorkspace, workspaces, layout, selectPanel, view, notify,
++    requestDraftInitialization, handOffDraft,
++  }
+ }
+ 
+ function lastOpening(open: MockInstance<UiWorkspaceService['openWorkspace']>): Promise<void> {
+@@ -980,6 +984,108 @@ describe('UiWorkspaceService', () => {
+     })
+   })
+ 
++  describe('New Session draft hand-off', () => {
++    const blanksWithDrafts = () => [
++      summary('older', { blank: true, cwd: '/w/a', updatedAt: 1 }),
++      summary('typed', { blank: true, cwd: '/w/a', updatedAt: 5 }),
++    ]
++
++    it('offers the abandoned blanks of the Workspace to the fresh Session, newest first', async () => {
++      const b = bench({
++        workspaces: workspaceState([workspace('a', [sid('older'), sid('typed')])]),
++        sessions: sessionState(blanksWithDrafts(), 'pending'),
++      })
++
++      b.uiWorkspace.startSession(wid('a'))
++
++      await vi.waitFor(() => { expect(b.handOffDraft).toHaveBeenCalledOnce() })
++      expect(b.handOffDraft).toHaveBeenCalledExactlyOnceWith(
++        [sid('typed'), sid('older')], b.sessions.retained[0]!.reference.binding,
++      )
++      expect(b.handOffDraft.mock.calls[0]![1].sessionId).toBe(sid('created-a'))
++    })
++
++    it('offers the remaining abandoned blank to a reused blank on explicit New Session', async () => {
++      const b = bench({
++        workspaces: workspaceState([workspace('a', [sid('older'), sid('typed')])]),
++        sessions: sessionState(blanksWithDrafts(), 'pending'),
++      })
++
++      b.uiWorkspace.startSession(wid('a'), { agentPreset: 'ptc' })
++
++      await vi.waitFor(() => { expect(b.handOffDraft).toHaveBeenCalledOnce() })
++      expect(b.sessions.create).toHaveBeenCalledExactlyOnceWith(
++        { workspaceId: wid('a'), sessionId: sid('older'), agentPreset: 'ptc' },
++      )
++      expect(b.handOffDraft).toHaveBeenCalledExactlyOnceWith(
++        [sid('typed')], b.sessions.retained[0]!.reference.binding,
++      )
++      expect(b.handOffDraft.mock.calls[0]![1].sessionId).toBe(sid('older'))
++    })
++
++    it('offers only unarchived blanks of the opened Workspace living at its directory', async () => {
++      const b = bench({
++        workspaces: workspaceState(
++          [workspace('a', [sid('typed')]), workspace('b', [sid('elsewhere')])],
++          [sid('archived')],
++        ),
++        sessions: sessionState([
++          summary('elsewhere', { blank: true, cwd: '/w/b', updatedAt: 9 }),
++          summary('archived', { blank: true, cwd: '/w/a', updatedAt: 8 }),
++          summary('moved', { blank: true, cwd: '/elsewhere', updatedAt: 7 }),
++          summary('typed', { blank: true, cwd: '/w/a', updatedAt: 1 }),
++        ], 'pending'),
++      })
++
++      b.uiWorkspace.startSession(wid('a'))
++
++      await vi.waitFor(() => { expect(b.handOffDraft).toHaveBeenCalledOnce() })
++      expect(b.handOffDraft.mock.calls[0]![0]).toEqual([sid('typed')])
++    })
++
++    it('reuses the Workspace blank instead of abandoning its draft', async () => {
++      const b = bench({
++        workspaces: workspaceState([workspace('a', [sid('typed')])]),
++        sessions: sessionState([summary('typed', { blank: true, cwd: '/w/a' })], 'pending'),
++      })
++
++      await b.uiWorkspace.openWorkspace(wid('a'))
++
++      expect(b.sessions.create).toHaveBeenCalledExactlyOnceWith({ workspaceId: wid('a'), sessionId: sid('typed') })
++      expect(b.sessions.retain).toHaveBeenCalledExactlyOnceWith(sid('typed'), { source: 'mainView' })
++      expect(b.handOffDraft).not.toHaveBeenCalled()
++    })
++
++    it('skips the hand-off when the Workspace has no abandoned blank', async () => {
++      const b = bench({
++        workspaces: workspaceState([workspace('a', [sid('saved')])]),
++        sessions: sessionState([summary('saved', { cwd: '/w/a' })], 'pending'),
++      })
++
++      b.uiWorkspace.startSession(wid('a'))
++
++      await vi.waitFor(() => {
++        expect(b.sessions.retain).toHaveBeenCalledExactlyOnceWith(sid('created-a'), { source: 'mainView' })
++      })
++      expect(b.handOffDraft).not.toHaveBeenCalled()
++    })
++
++    it('keeps the abandoned draft with its blank when explicit preparation fails', async () => {
++      const b = bench({
++        workspaces: workspaceState([workspace('a', [sid('older'), sid('typed')])]),
++        sessions: sessionState(blanksWithDrafts(), 'pending'),
++      })
++      vi.spyOn(console, 'warn').mockImplementation(() => undefined)
++      const opening = vi.spyOn(b.uiWorkspace, 'openWorkspace')
++      b.requestDraftInitialization.mockReturnValue('blocked')
++
++      b.uiWorkspace.startSession(wid('a'), { prompt: 'unsent' })
++      await expect(lastOpening(opening)).rejects.toThrow('Could not fill the draft. Please try again shortly.')
++
++      expect(b.handOffDraft).not.toHaveBeenCalled()
++    })
++  })
++
+   it('releases a prepared Workspace target when synchronous preparation supersedes it', async () => {
+     const b = bench({ workspaces: workspaceState([workspace('a')]) })
+ 
+diff --git a/packages/extensions/cordis-client-runner/src/client/api-catalog.ts b/packages/extensions/cordis-client-runner/src/client/api-catalog.ts
+index 1dd6bf22b9..37efc8a266 100644
+--- a/packages/extensions/cordis-client-runner/src/client/api-catalog.ts
++++ b/packages/extensions/cordis-client-runner/src/client/api-catalog.ts
+@@ -342,7 +342,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
+       },
+       {
+         signature: 'openWorkspace( workspaceId: WorkspaceId, beforeOpen?: (sessionId: SessionId) => void, options?: Pick<StartSessionOptions, \'agentPreset\'>, ): Promise<void>',
+-        description: 'Connect a Workspace and open its Session unless a later navigation supersedes it.',
++        description: 'Connect a Workspace and open its Session unless a later navigation supersedes it. The opened Session takes over the newest unsent draft of the blanks in that Workspace other than itself: text and inline references move, attachments stay with their blank, and that blank\'s saved draft is dropped.',
+         parameters: [{ name: 'workspaceId', description: 'target Workspace.' }, { name: 'beforeOpen', description: 'optional synchronous preparation for the selected Session, skipped after supersession; a throw aborts the open and releases the retained reference.' }, { name: 'options', description: 'choices for the Session the connection creates or reuses.' }],
+         returns: 'completion; a superseded request may create a Session but does not open it.',
+         throws: ['on failure; a refused creation is also shown through the Workspace notice unless a later navigation or disposal superseded the request.'],
+@@ -361,7 +361,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
+       },
+       {
+         signature: 'startSession(workspaceId?: WorkspaceId, options?: StartSessionOptions): void',
+-        description: 'Create a fresh Session, or reuse a blank when preparing an explicit draft. A creation the Host refuses is shown through the Workspace notice and leaves the selection as it was.',
++        description: 'Create a fresh Session, or reuse a blank when preparing an explicit draft. The Session it opens takes over the newest unsent draft of a blank Session it abandons in the same Workspace. A creation the Host refuses is shown through the Workspace notice and leaves the selection as it was.',
+         parameters: [{ name: 'workspaceId', description: 'explicit target; absent inherits the current or most recent Workspace.' }, { name: 'options', description: 'initial content and the reused blank\'s preset; existing text or attachments are preserved unless clearPreviousDraft is true.' }],
+       },
+       {
+-- 
+2.54.0 (Apple Git-157)
+
