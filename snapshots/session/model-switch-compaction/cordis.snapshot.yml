@@ -1,4 +1,4 @@
-# The second request selects a smaller model before its header is committed.
+# The first organization route disappears before the second request selects a smaller model.
 
 - id: agent-instructions
   disabled: true

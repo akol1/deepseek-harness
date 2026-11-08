@@ -13,7 +13,7 @@ import {
   resolveTargetPolicy,
 } from '@deepseek-ai/dsh-compaction-basic/src/config.ts'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
-import LlmRuntime, { createUserMessage, ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, createSystemMessage, createToolResultMessage, LlmAdapter , createMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, createSystemMessage, createToolResultMessage, LlmAdapter , LlmError, createMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
@@ -28,6 +28,7 @@ import type {
 import SessionStore, { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import { estimateContent, estimateToolsTokens, ROLE_OVERHEAD } from '@deepseek-ai/dsh-token-meter/estimate'
 import { agentEvents, type Agent, type RequestErrorAction } from '@deepseek-ai/dsh-agent'
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 
@@ -577,6 +578,29 @@ describe('compact configuration and defaults', () => {
 })
 
 describe('pressure measurement and retention', () => {
+  it('bounds a selected prefix at the exact input budget, including its retained system head', () => {
+    const ctx = createContext()
+    const session = conversation(3, undefined, 'retained system')
+    const priced = ctx.tokenMeter.measure(session)
+    const nodes = priced.nodes
+    const exact = nodes[0]!.tokens + nodes[1]!.tokens + nodes[2]!.tokens
+
+    expect(selectCompactableRange(session, priced, 0, exact))
+      .toEqual({ start: nodes[1]!.seq, end: nodes[2]!.seq })
+    expect(selectCompactableRange(session, priced, 0, nodes[0]!.tokens + nodes[1]!.tokens - 1))
+      .toBeNull()
+  })
+
+  it('backs a budget-limited prefix away from an unmatched tool call', () => {
+    const ctx = createContext()
+    const session = toolConversation()
+    const priced = ctx.tokenMeter.measure(session)
+    const nodes = priced.nodes
+
+    expect(selectCompactableRange(session, priced, 0, nodes[0]!.tokens + nodes[1]!.tokens))
+      .toEqual({ start: nodes[0]!.seq, end: nodes[0]!.seq })
+  })
+
   const compactConfig: BasicCompactionConfig = {
     auto: false,
     thresholdRatio: 0.5,
@@ -1690,16 +1714,34 @@ describe('model-switch pressure', () => {
     void new TokenMeter(ctx)
     onTestFinished(() => ctx.fiber.dispose())
     const adapter = new ScriptedAdapter([{ type: 'text', text: 'checkpoint' }], finish)
-    ctx.llm.registerAdapter(['small'], new ContextAdapter(1_000))
-    ctx.llm.registerAdapter([MODEL], adapter)
+    const resolve = adapter.resolveModel.bind(adapter)
+    vi.spyOn(adapter, 'resolveModel').mockImplementation((provider, model, signal) => provider === 'small'
+      ? Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 1_000 } })
+      : resolve(provider, model, signal))
+    ctx.llm.registerAdapter(['small'], adapter)
+    const previousRegistration = ctx.llm.registerAdapter([MODEL], adapter)
     const compact = new BasicCompactionEngine(ctx, {
       headroomTokens: 0, maxTokens: 32, thresholdRatio: 0.5, retainTokens: 100, ...config,
     })
-    return { ctx, adapter, compact }
+    return { ctx, adapter, compact, previousRegistration }
   }
 
-  it('checks the newly routed window and summarizes with the previous model before returning it', async () => {
-    const { ctx, adapter } = harness()
+  function summaryDestination(
+    ctx: Context,
+    provider: string,
+    finish?: Extract<StreamChunk, { type: 'finish' }>['reason'],
+  ): ScriptedAdapter {
+    const adapter = new ScriptedAdapter([{ type: 'text', text: 'destination checkpoint' }], finish)
+    vi.spyOn(adapter, 'resolveModel').mockImplementation((route, model) => Promise.resolve({
+      provider: route, id: model, name: model, context: { contextWindow: 1_000 },
+    }))
+    ctx.llm.registerAdapter([provider], adapter)
+    return adapter
+  }
+
+  it('checks the newly routed window and summarizes bounded spans with that model before returning it', async () => {
+    const { ctx, adapter } = harness({ compactionRetries: 8 })
+    const stream = vi.spyOn(adapter, 'stream')
     const session = conversation(4, 'fixture '.repeat(80))
     const previous = session.requestHeader()
     const selected = { provider: 'small', model: 'small' }
@@ -1709,11 +1751,65 @@ describe('model-switch pressure', () => {
 
     await expect(request(ctx, session, { provider: MODEL, model: MODEL })).resolves.toEqual(selected)
 
-    expect(adapter.lastOptions).toMatchObject({ provider: MODEL, model: MODEL, purpose: 'compaction' })
+    expect(adapter.lastOptions).toMatchObject({ ...selected, purpose: 'compaction' })
     expect(ctx.tokenMeter.measure(session, { config: selected }).totalTokens).toBeLessThan(500)
     expect(session.requestHeader()).toEqual(previous)
     expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary'))
-      .toHaveLength(1)
+      .toHaveLength(3)
+    for (const [options] of stream.mock.calls) {
+      const inputTokens = options.messages.reduce((sum, message) => sum + estimateContent(message.content) + ROLE_OVERHEAD, 0)
+      expect(inputTokens + options.maxTokens!).toBeLessThanOrEqual(1_000)
+    }
+  })
+
+  it('reserves the replayed system prompt, tools, instruction and summary output in every destination call', async () => {
+    const { ctx, adapter } = harness({ compactionRetries: 8 })
+    const stream = vi.spyOn(adapter, 'stream')
+    const session = conversation(4, undefined, 'system '.repeat(30))
+    const tools = [{ name: 'read', description: 'details '.repeat(30), parameters: { type: 'object' } }]
+    session.append('request/header', {
+      header: { config: { provider: MODEL, model: MODEL }, tools }, reason: 'change',
+    })
+
+    await request(ctx, session, { provider: 'small', model: 'small' })
+
+    expect(stream).toHaveBeenCalled()
+    for (const [options] of stream.mock.calls) {
+      const inputTokens = options.messages.reduce((sum, message) => sum + estimateContent(message.content) + ROLE_OVERHEAD, 0)
+        + estimateToolsTokens({
+          config: { provider: options.provider, model: options.model },
+          ...options.tools === undefined ? {} : { tools: options.tools },
+        })
+      expect(options.tools).toEqual(tools)
+      expect(inputTokens + options.maxTokens!).toBeLessThanOrEqual(1_000)
+    }
+  })
+
+  it('keeps the destination policy headroom outside every summary input and output budget', async () => {
+    const { ctx, adapter } = harness({ headroomTokens: 128, compactionRetries: 4 })
+    const stream = vi.spyOn(adapter, 'stream')
+
+    await request(ctx, conversation(4), { provider: 'small', model: 'small' })
+
+    expect(stream).toHaveBeenCalled()
+    for (const [options] of stream.mock.calls) {
+      const inputTokens = options.messages.reduce((sum, message) => sum + estimateContent(message.content) + ROLE_OVERHEAD, 0)
+      expect(inputTokens + options.maxTokens! + 128).toBeLessThanOrEqual(1_000)
+    }
+  })
+
+  it('stops at the configured retry budget while keeping bounded destination checkpoints', async () => {
+    const { ctx, adapter } = harness({ compactionRetries: 0 })
+    const stream = vi.spyOn(adapter, 'stream')
+    const session = conversation(4, 'fixture '.repeat(80))
+    const previous = session.requestHeader()
+
+    await expect(request(ctx, session, { provider: 'small', model: 'small' }))
+      .rejects.toThrow('still above threshold after 1 compaction attempts')
+
+    expect(stream).toHaveBeenCalledTimes(1)
+    expect(session.requestHeader()).toEqual(previous)
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary')).toHaveLength(1)
   })
 
   it('uses the proposed output reservation and the destination retention policy', async () => {
@@ -1725,6 +1821,187 @@ describe('model-switch pressure', () => {
     await request(ctx, session, { provider: 'small', model: 'small', maxTokens: 700 })
     expect(adapter.lastOptions).toBeDefined()
     expect(ctx.tokenMeter.measure(session).totalTokens).toBeLessThan(300)
+  })
+
+  it('continues on the selected provider after the previous provider is removed', async () => {
+    const { ctx, adapter, previousRegistration } = harness({
+      modelPolicies: [{ provider: 'destination', model: 'new-model', maxTokens: 77 }],
+    })
+    const destination = summaryDestination(ctx, 'destination')
+    const oldStream = vi.spyOn(adapter, 'stream')
+    const session = conversation(4)
+    const previous = session.requestHeader()
+    const originalEvents = session.snapshotEvents()
+    previousRegistration()
+
+    const selected = { provider: 'destination', model: 'new-model' }
+    await expect(request(ctx, session, selected)).resolves.toEqual(selected)
+
+    expect(oldStream).not.toHaveBeenCalled()
+    expect(destination.lastOptions).toMatchObject({ ...selected, maxTokens: 77, purpose: 'compaction' })
+    expect(session.requestHeader()).toEqual(previous)
+    expect(session.snapshotEvents().slice(0, originalEvents.length)).toEqual(originalEvents)
+    expect(session.snapshotEvents().findLast(event => event.type === 'compaction/summary')?.data)
+      .toMatchObject({ ...selected, maxTokens: 77 })
+    expect(ctx.tokenMeter.measure(session, { config: selected }).totalTokens).toBeLessThan(500)
+  })
+
+  it('continues on another model of the same provider after the previous model is removed', async () => {
+    const { ctx, adapter } = harness()
+    vi.spyOn(adapter, 'resolveModel').mockImplementation((provider, model) => {
+      if (model === MODEL) throw new LlmError('previous model removed', 'UNKNOWN_MODEL')
+      return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 1_000 } })
+    })
+    const stream = vi.spyOn(adapter, 'stream')
+    const session = conversation(4)
+    const previous = session.requestHeader()
+    const selected = { provider: MODEL, model: 'new-company/new-model' }
+
+    await expect(request(ctx, session, selected)).resolves.toEqual(selected)
+
+    expect(stream).toHaveBeenCalledTimes(1)
+    expect(adapter.lastOptions).toMatchObject(selected)
+    expect(session.requestHeader()).toEqual(previous)
+  })
+
+  it('uses the destination policy summary override when the previous provider is removed', async () => {
+    const { ctx, previousRegistration } = harness({ modelPolicies: [{
+      provider: 'destination', model: 'new-model', maxTokens: 55,
+      summarizationProvider: 'summary', summarizationModel: 'chosen-summary',
+    }] })
+    previousRegistration()
+    const destination = summaryDestination(ctx, 'destination')
+    const explicit = summaryDestination(ctx, 'summary')
+    const session = conversation(4)
+
+    await request(ctx, session, { provider: 'destination', model: 'new-model' })
+
+    expect(explicit.lastOptions).toMatchObject({ provider: 'summary', model: 'chosen-summary', maxTokens: 55 })
+    expect(destination.lastOptions).toBeUndefined()
+  })
+
+  it('keeps concurrent sessions on their own explicit destinations', async () => {
+    const { ctx, previousRegistration } = harness()
+    previousRegistration()
+    const firstAdapter = summaryDestination(ctx, 'first')
+    const secondAdapter = summaryDestination(ctx, 'second')
+    const firstEntered = Promise.withResolvers<undefined>()
+    const secondEntered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    const firstStream = firstAdapter.stream.bind(firstAdapter)
+    const secondStream = secondAdapter.stream.bind(secondAdapter)
+    vi.spyOn(firstAdapter, 'stream').mockImplementation(async function* (options) {
+      firstEntered.resolve(undefined)
+      await release.promise
+      yield* firstStream(options)
+    })
+    vi.spyOn(secondAdapter, 'stream').mockImplementation(async function* (options) {
+      secondEntered.resolve(undefined)
+      await release.promise
+      yield* secondStream(options)
+    })
+    const firstSelected = { provider: 'first', model: 'first-model' }
+    const secondSelected = { provider: 'second', model: 'second-model' }
+    const first = request(ctx, conversation(3), firstSelected)
+    let second: Promise<LlmCallConfig> | undefined
+    try {
+      await Promise.race([firstEntered.promise, first])
+      second = request(ctx, conversation(4), secondSelected)
+      await Promise.race([secondEntered.promise, second])
+      release.resolve(undefined)
+
+      await expect(first).resolves.toEqual(firstSelected)
+      await expect(second).resolves.toEqual(secondSelected)
+      expect(firstAdapter.lastOptions).toMatchObject(firstSelected)
+      expect(secondAdapter.lastOptions).toMatchObject(secondSelected)
+    } finally {
+      release.resolve(undefined)
+      await Promise.allSettled(second === undefined ? [first] : [first, second])
+    }
+  })
+
+  it.each([true, false])('keeps an explicit summary target when the previous provider is gone (available: %s)', async (available) => {
+    const { ctx, previousRegistration } = harness({
+      summarizationProvider: 'summary', summarizationModel: 'configured-summary',
+    })
+    previousRegistration()
+    const destination = summaryDestination(ctx, 'destination')
+    const explicit = available ? summaryDestination(ctx, 'summary') : undefined
+    const session = conversation(4)
+    const previous = session.requestHeader()
+    const selected = { provider: 'destination', model: 'new-model' }
+    const switching = request(ctx, session, selected)
+
+    if (available) {
+      await expect(switching).resolves.toEqual(selected)
+      expect(explicit?.lastOptions).toMatchObject({ provider: 'summary', model: 'configured-summary' })
+    } else {
+      await expect(switching).rejects.toMatchObject({ code: 'MODEL_SWITCH_COMPACTION_FAILED' })
+    }
+    expect(destination.lastOptions).toBeUndefined()
+    expect(session.requestHeader()).toEqual(previous)
+  })
+
+  it.each(['AUTH', 'INVALID_CONFIG', 'RATE_LIMIT'])('does not access the previous target or credential after an explicit switch (%s)', async (code) => {
+    const { ctx, adapter } = harness()
+    const previousModel = vi.spyOn(adapter, 'resolveModel').mockRejectedValue(new LlmError('previous route refused', code))
+    const previousStream = vi.spyOn(adapter, 'stream').mockImplementation(() => {
+      throw new LlmError('previous credential unavailable', 'AUTH')
+    })
+    const destination = summaryDestination(ctx, 'destination')
+    const session = conversation(4)
+    const previous = session.requestHeader()
+    const selected = { provider: 'destination', model: 'new-model' }
+
+    await expect(request(ctx, session, selected)).resolves.toEqual(selected)
+
+    expect(previousModel).not.toHaveBeenCalled()
+    expect(previousStream).not.toHaveBeenCalled()
+    expect(destination.lastOptions).toMatchObject(selected)
+    expect(session.requestHeader()).toEqual(previous)
+  })
+
+  it('keeps history and the prior header when the destination summary fails', async () => {
+    const { ctx, previousRegistration } = harness()
+    previousRegistration()
+    summaryDestination(ctx, 'destination', {
+      kind: 'error', failure: { code: 'AUTH', message: 'destination credentials refused' },
+    })
+    const session = conversation(4)
+    const previous = session.requestHeader()
+    const nodes = [...session.surface.nodes]
+    const originalEvents = session.snapshotEvents()
+
+    await expect(request(ctx, session, { provider: 'destination', model: 'new-model' }))
+      .rejects.toThrow('destination credentials refused')
+
+    expect(session.requestHeader()).toEqual(previous)
+    expect(session.surface.nodes).toEqual(nodes)
+    expect(session.snapshotEvents().slice(0, originalEvents.length)).toEqual(originalEvents)
+    expect(session.snapshotEvents().at(-1)).toMatchObject({
+      type: 'compaction/end', data: { error: 'destination credentials refused' },
+    })
+  })
+
+  it('preserves cancellation before the destination summary without accessing the previous route', async () => {
+    const { ctx, adapter } = harness()
+    const controller = new AbortController()
+    const cancelled = new Error('cancel previous-route lookup')
+    const previousModel = vi.spyOn(adapter, 'resolveModel')
+    const destination = summaryDestination(ctx, 'destination')
+    vi.spyOn(destination, 'resolveModel').mockImplementation(() => {
+      controller.abort(cancelled)
+      throw cancelled
+    })
+    const session = conversation(4)
+    const previous = session.requestHeader()
+
+    await expect(request(ctx, session, { provider: 'destination', model: 'new-model' }, controller.signal))
+      .rejects.toBe(cancelled)
+
+    expect(destination.lastOptions).toBeUndefined()
+    expect(previousModel).not.toHaveBeenCalled()
+    expect(session.requestHeader()).toEqual(previous)
   })
 
   it.each([false, true])('requires a valid small-window policy even for short history (override: %s)', async (override) => {
@@ -1743,8 +2020,8 @@ describe('model-switch pressure', () => {
     expect(adapter.lastOptions).toBeUndefined()
   })
 
-  it('repeatedly summarizes on the previous route until destination pressure is below threshold', async () => {
-    const { ctx, adapter } = harness()
+  it('repeatedly summarizes on an explicit summary route until destination pressure is below threshold', async () => {
+    const { ctx, adapter } = harness({ summarizationProvider: MODEL, summarizationModel: MODEL })
     const first = new ScriptedAdapter([{ type: 'text', text: 'm'.repeat(1_600) }])
     const calls = vi.spyOn(adapter, 'stream').mockImplementationOnce(options => first.stream(options))
     const session = conversation(4, 'fixture '.repeat(80))
@@ -1763,7 +2040,7 @@ describe('model-switch pressure', () => {
   it.each(['summary error', 'non-shrinking summary', 'cancellation'] as const)(
     'keeps the first checkpoint and permits retry after a second-attempt %s',
     async (failure) => {
-      const { ctx, adapter } = harness()
+      const { ctx, adapter } = harness({ summarizationProvider: MODEL, summarizationModel: MODEL })
       const first = new ScriptedAdapter([{ type: 'text', text: 'm'.repeat(1_600) }])
       const second = failure === 'non-shrinking summary' ? first : new ScriptedAdapter([], {
         kind: 'error', failure: { code: 'AUTH', message: 'summary credentials expired' },
@@ -1795,7 +2072,9 @@ describe('model-switch pressure', () => {
   )
 
   it('stops after the destination retry budget while retaining completed checkpoints', async () => {
-    const { ctx, adapter } = harness({ compactionRetries: 2 })
+    const { ctx, adapter } = harness({
+      compactionRetries: 2, summarizationProvider: MODEL, summarizationModel: MODEL,
+    })
     const calls = vi.spyOn(adapter, 'stream')
     for (const length of [1_600, 1_500, 1_400]) {
       const summary = new ScriptedAdapter([{ type: 'text', text: 'm'.repeat(length) }])
@@ -1909,9 +2188,18 @@ describe('model-switch pressure', () => {
 })
 
 describe('automatic listener and loader composition', () => {
-  function preStep(ctx: Context, owner: Agent, signal = SIGNAL) {
+  function preStep(
+    ctx: Context,
+    owner: Agent,
+    signal = SIGNAL,
+    selected?: { provider: string; model: string },
+  ) {
+    const previous = owner.session.requestHeader()?.config
     return agentEvents(ctx, owner).waterfall(
-      'agent/pre-step', { modelSelection: { provider: 'mock', model: 'mock' }, messages: [], turn: 1, step: 1, signal },
+      'agent/pre-step', {
+        modelSelection: selected ?? { provider: previous?.provider ?? 'mock', model: previous?.model ?? 'mock' },
+        messages: [], turn: 1, step: 1, signal,
+      },
       () => Promise.resolve({ kind: 'enter' as const, messages: [] }),
     )
   }
@@ -1970,6 +2258,32 @@ describe('automatic listener and loader composition', () => {
 
     expect(compactIfNeeded).not.toHaveBeenCalled()
     expect(pressured.snapshotEvents().some(event => event.type === 'compaction/start')).toBe(false)
+  })
+
+  it.each([
+    { provider: 'selected-provider', model: MODEL },
+    { provider: MODEL, model: 'selected-model' },
+  ])('defers old-route pressure when the captured selection changes to $provider/$model', async (selected) => {
+    const ctx = createContext()
+    const compact = new TestCompactionEngine(ctx, {
+      headroomTokens: 0, maxTokens: 32, thresholdRatio: 0.5, retainTokens: 180,
+    })
+    const compactIfNeeded = vi.spyOn(compact, 'compactIfNeeded')
+    const session = conversation(4)
+
+    await expect(preStep(ctx, agent(session, MODEL), SIGNAL, selected))
+      .resolves.toEqual({ kind: 'enter', messages: [] })
+
+    expect(compactIfNeeded).not.toHaveBeenCalled()
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/start')).toBe(false)
+  })
+
+  it('leaves headerless pre-step pressure to the ordinary no-route check', async () => {
+    const ctx = createContext()
+    const compact = new TestCompactionEngine(ctx, { headroomTokens: 0, maxTokens: 32 })
+    const compactIfNeeded = vi.spyOn(compact, 'compactIfNeeded')
+    await preStep(ctx, agent(Session.create(SessionId('headerless-step'))))
+    expect(compactIfNeeded).toHaveBeenCalledTimes(1)
   })
 
   it('warns and continues after operational failures, including non-Errors', async () => {

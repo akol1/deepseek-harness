@@ -7,8 +7,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { contentHasImage, BlockAssembler, LlmError } from '@deepseek-ai/dsh-llm'
 import { deepFreeze } from '@deepseek-ai/dsh-util-values'
+import { estimateContent, ROLE_OVERHEAD } from '@deepseek-ai/dsh-token-meter/estimate'
 import type {
-  ContentBlock, FinishReason, GenerateOptions, Message, RequestMessage, TokenUsage, ToolSchema,
+  ContentBlock, FinishReason, GenerateOptions, LlmCallConfig, Message, RequestMessage, TokenUsage, ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
@@ -81,6 +82,16 @@ export interface SummarizationInput {
   readonly tools?: readonly ToolSchema[]
   /** The derived system head, when present, followed by the shadowed region in surface order. */
   readonly messages: readonly Message[]
+  /** Explicit destination used for switch summaries unless a summary target is configured. */
+  readonly modelSwitchTarget?: Readonly<Pick<LlmCallConfig, 'provider' | 'model'>>
+}
+
+/**
+ * Estimate the auxiliary instruction with the conversation meter's text and message framing prices.
+ * @returns instruction tokens, including the anonymous user message's framing.
+ */
+export function summaryInstructionTokens(): number {
+  return estimateContent([{ type: 'text', text: COMPACTION_INSTRUCTION }]) + ROLE_OVERHEAD
 }
 
 /** Safe summary content plus the exact auxiliary call envelope recorded with it. */

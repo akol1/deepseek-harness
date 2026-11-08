@@ -173,7 +173,7 @@ function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
   })
 }
 
-function overflowHistorySeed(): readonly SessionEvent[] {
+function overflowHistorySeed(previous?: { provider: string; model: string }): readonly SessionEvent[] {
   const session = Session.create(SessionId('overflow-history-seed'))
   for (let turn = 1; turn <= 2; turn += 1) {
     const sentinel = turn === 1 ? 'OLD HISTORY SENTINEL' : 'RECENT HISTORY'
@@ -185,6 +185,11 @@ function overflowHistorySeed(): readonly SessionEvent[] {
       source: { kind: 'user' },
     }), { surfaceOp: 'append' })
     session.append('step/start', { turn, step: 1 })
+    if (turn === 1 && previous !== undefined) {
+      session.append('request/header', {
+        header: { config: previous }, reason: 'initial',
+      })
+    }
     session.append('assistant/message', {
       stream: [],
       turn,
@@ -194,7 +199,7 @@ function overflowHistorySeed(): readonly SessionEvent[] {
         content: [{ type: 'text', text: `historical response ${turn} ${'detail '.repeat(200)}` }],
         source: {
           kind: 'model',
-          ...{ provider: 'mock', model: 'mock' },
+          ...(previous ?? { provider: 'mock', model: 'mock' }),
         },
       }),
     }, { surfaceOp: 'append' })
@@ -362,6 +367,80 @@ describe('token pressure after loop-admitted system prompts', () => {
       expect(requests[0]?.messages[0]?.content).toEqual([{ type: 'text', text: 'initial guidance '.repeat(8) }])
       if (retry) expect(requests[1]?.messages[0]?.content).toEqual(requests[0]?.messages[0]?.content)
       expect(requests.at(-1)?.messages.some(message => message.role === 'system')).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
+describe('model switches before real-loop pre-step pressure', () => {
+  it.each([false, true])('uses only the selected destination when the prior route is pressured (expired: %s)', async (expired) => {
+    const ctx = new Context()
+    const previous = { provider: 'previous-company', model: 'previous-model' }
+    const destination = { provider: 'destination-company', model: 'destination-model' }
+    const priorLookups: string[] = []
+    const priorRequests: GenerateOptions[] = []
+    const destinationRequests: GenerateOptions[] = []
+    const adapter = new class extends LlmAdapter {
+      override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+        if (provider === previous.provider) priorLookups.push(model)
+        return Promise.resolve({
+          provider, id: model, name: model,
+          context: { contextWindow: provider === previous.provider ? 4_000 : 8_000 },
+        })
+      }
+
+      override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+        if (options.provider === previous.provider) {
+          priorRequests.push(options)
+          if (expired) throw new LlmError('previous company credential expired', 'AUTH')
+        } else {
+          destinationRequests.push(options)
+        }
+        const text = options.purpose === 'compaction' ? 'DESTINATION CHECKPOINT' : 'DESTINATION COMPLETE'
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      }
+    }()
+    try {
+      await mountAgentLoopTestDependencies(ctx)
+      await ctx.plugin(AgentLoop, { agents: [] })
+      await ctx.plugin(TokenMeter)
+      ctx.llm.registerAdapter([previous.provider, destination.provider], adapter)
+      await ctx.plugin(BasicCompactionEngine, {
+        headroomTokens: 0,
+        thresholdRatio: 0.2,
+        retainTokens: 100,
+        maxTokens: 64,
+        compactionRetries: 2,
+      })
+      const { agent } = await ctx.agentLoop.createAgent(ctx, {
+        sessionId: SessionId(`switched-company-${expired}`),
+        seed: overflowHistorySeed(previous),
+        agentOptions: previous,
+      })
+      expect(ctx.tokenMeter.measure(agent.session).totalTokens).toBeGreaterThan(8_000 * 0.2)
+      agent.model.select(destination)
+      const original = agent.session.snapshotEvents()
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text: 'continue on the selected company and model' }],
+        source: { kind: 'user' },
+      }))
+      await agent.whenIdle()
+
+      expect(priorLookups).toEqual([])
+      expect(priorRequests).toEqual([])
+      expect(destinationRequests.map(request => request.purpose)).toEqual(['compaction', undefined])
+      expect(destinationRequests.every(request => request.provider === destination.provider
+        && request.model === destination.model)).toBe(true)
+      expect(agent.session.requestHeader()?.config).toMatchObject(destination)
+      const events = agent.session.snapshotEvents()
+      expect(events.slice(0, original.length)).toEqual(original)
+      expect(events.filter(event => event.type === 'compaction/summary').map(event => ({
+        provider: event.data.provider, model: event.data.model,
+      }))).toEqual([destination])
+      expect(events.at(-1)).toMatchObject({ type: 'turn/end', data: { reason: { kind: 'completed' } } })
     } finally {
       await ctx.fiber.dispose()
     }

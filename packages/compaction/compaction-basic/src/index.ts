@@ -27,12 +27,13 @@ import {
   compactSurfaceRegion,
   selectCompactableRange,
 } from './region.ts'
-import { summarizeWithLlm } from './summarizer.ts'
+import { summarizeWithLlm, summaryInstructionTokens } from './summarizer.ts'
 import type { SummarizationInput, SummaryResult } from './summarizer.ts'
 import type {
   BasicCompactionConfig,
   ModelCompactPolicyConfig,
   ResolvedConfig,
+  ResolvedTargetPolicy,
 } from './types.ts'
 
 export type {
@@ -155,10 +156,13 @@ export class BasicCompactionEngine extends CompactionEngine {
     }
 
     ctx.on('agent/pre-step', async (
-      { agent, signal },
+      { agent, signal, modelSelection },
       next,
     ): Promise<PreStepDecision> => {
-      if (!signal.aborted) {
+      const previous = routedTarget(agent.session)
+      const switching = previous !== undefined
+        && (modelSelection.provider !== previous.provider || modelSelection.model !== previous.model)
+      if (!signal.aborted && !switching) {
         try {
           const result = await this.compactIfNeeded(agent, 'pressure', signal)
           if (result !== null) logResult(result, 'step pressure')
@@ -178,8 +182,8 @@ export class BasicCompactionEngine extends CompactionEngine {
       if (status === 'idle') this.overflowRetries.delete(agent)
     })
 
-    // Prepend wraps routing listeners: await their final selection while the
-    // committed header still identifies the model that can summarize the history.
+    // Prepend wraps routing listeners: check their final destination before
+    // committing its header, with the previous history still intact.
     ctx.on('agent/request', async ({ agent, signal }, next) => {
       const config = await next()
       const previous = agent.session.requestHeader()
@@ -260,7 +264,8 @@ export class BasicCompactionEngine extends CompactionEngine {
   /**
    * Summarize the replayed conversation region through a direct one-shot
    * `ctx.llm.stream()` call whose prefix reuses the conversation's own system
-   * prompt, tools, and messages so the provider's KV cache is not invalidated.
+   * prompt, tools, and messages. A model switch uses its selected destination
+   * without requiring the previous route or credentials.
    * Override this sole hook for a template or remote summarizer.
    * @param input - replayed conversation prefix (system, tools, and leading messages) to condense.
    * @param agent - supplies routed-model history, fallback model, and session id.
@@ -272,11 +277,26 @@ export class BasicCompactionEngine extends CompactionEngine {
     agent: Agent,
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
+    const config = this.summaryPolicy(agent, input.modelSwitchTarget)
+    return summarizeWithLlm(this.ctx, config, input, agent, signal)
+  }
+
+  /** An explicit summary route wins; an explicit model switch otherwise uses its destination policy. */
+  private summaryPolicy(
+    agent: Agent,
+    modelSwitchTarget?: Pick<LlmCallConfig, 'provider' | 'model'>,
+  ): ResolvedConfig | ResolvedTargetPolicy {
     const target = conversationTarget(agent)
     const config = target === undefined
       ? this.config
       : resolveTargetPolicy(this.config, target)
-    return summarizeWithLlm(this.ctx, config, input, agent, signal)
+    if (modelSwitchTarget === undefined || config.summarizationProvider.length > 0) return config
+    const policy = resolveTargetPolicy(this.config, modelSwitchTarget)
+    return policy.summarizationProvider.length > 0 ? policy : {
+      ...policy,
+      summarizationProvider: modelSwitchTarget.provider,
+      summarizationModel: modelSwitchTarget.model,
+    }
   }
 
   /**
@@ -350,8 +370,17 @@ export class BasicCompactionEngine extends CompactionEngine {
     if (measurement.totalTokens < spec.thresholdTokens) return null
 
     let result: CompactionResult | null = null
+    const modelSwitchTarget = requireBelowThreshold
+      ? { provider: target.provider, model: target.model }
+      : undefined
+    const summaryPolicy = modelSwitchTarget === undefined ? undefined : this.summaryPolicy(agent, modelSwitchTarget)
     for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
-      const range = selectCompactableRange(agent.session, measurement, spec.retainTokens)
+      const maxInputTokens = summaryPolicy?.summarizationProvider === target.provider
+        && summaryPolicy.summarizationModel === target.model
+        ? info.context.contextWindow - summaryPolicy.maxTokens - summaryPolicy.headroomTokens - summaryInstructionTokens()
+          - Math.max(0, measurement.totalTokens - measurement.surfaceTokens)
+        : undefined
+      const range = selectCompactableRange(agent.session, measurement, spec.retainTokens, maxInputTokens)
       if (range === null) {
         if (result === null && !requireBelowThreshold) return null
         throw new Error(
@@ -359,9 +388,12 @@ export class BasicCompactionEngine extends CompactionEngine {
           + `(${measurement.totalTokens} estimated tokens >= threshold ${spec.thresholdTokens})`,
         )
       }
-      result = await this.compactRegion(range.start, range.end, agent, signal)
+      result = requireBelowThreshold
+        ? await this.compactOpenRegion(range.start, range.end, agent, signal, modelSwitchTarget)
+        : await this.compactRegion(range.start, range.end, agent, signal)
       measurement = meter.measure(agent.session, header)
-      if (measurement.totalTokens < spec.thresholdTokens) return result
+      if (measurement.totalTokens >= spec.thresholdTokens) continue
+      return result
     }
 
     throw new Error(
@@ -385,8 +417,19 @@ export class BasicCompactionEngine extends CompactionEngine {
     agent: Agent,
     signal?: AbortSignal,
   ): Promise<CompactionResult> {
+    return this.compactOpenRegion(start, end, agent, signal)
+  }
+
+  /** Compact an open-turn span with an optional explicitly selected switch destination. */
+  private compactOpenRegion(
+    start: SessionSeq,
+    end: SessionSeq,
+    agent: Agent,
+    signal?: AbortSignal,
+    modelSwitchTarget?: Pick<LlmCallConfig, 'provider' | 'model'>,
+  ): Promise<CompactionResult> {
     return compactSurfaceRegion(
-      this.regionDependencies(),
+      this.regionDependencies(modelSwitchTarget),
       agent.session,
       start,
       end,
@@ -459,10 +502,14 @@ export class BasicCompactionEngine extends CompactionEngine {
   }
 
   /** Bind the effective token meter and dynamically dispatched summarizer hook. */
-  private regionDependencies(): Parameters<typeof compactSurfaceRegion>[0] {
+  private regionDependencies(
+    modelSwitchTarget?: Pick<LlmCallConfig, 'provider' | 'model'>,
+  ): Parameters<typeof compactSurfaceRegion>[0] {
     return {
       meter: this.ctx.tokenMeter,
-      summarize: (input, owner, abort) => this.summarize(input, owner, abort),
+      summarize: (input, owner, abort) => this.summarize(
+        modelSwitchTarget === undefined ? input : { ...input, modelSwitchTarget }, owner, abort,
+      ),
       recover: (error, agent, sourceEventSeqs, signal) => this.ctx.waterfall('compaction/summary-error', {
         session: agent.session,
         sourceEventSeqs,

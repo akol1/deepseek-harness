@@ -24,14 +24,14 @@
   en: 4cb73d7a57908948
   zh: 7ba2ddc4c76e4957
 /deepseek-ai-dsh-compaction-basic/use-this-package/tuning-when-condensation-starts:
-  en: 3446c54c062d7e34
-  zh: fb502c941e508ae0
+  en: 79c2dc728605594d
+  zh: bff51bc13dd5e602
 /deepseek-ai-dsh-compaction-basic/use-this-package/what-happens-when-condensation-runs:
   en: c872a8ef069596f0
   zh: b3a48e309ae830d4
 /deepseek-ai-dsh-compaction-basic/use-this-package/switching-models:
-  en: 48978abc46da1afa
-  zh: 11931af05db7b41f
+  en: 8b6a0d736d19226a
+  zh: 599b9ffd009ffbf7
 /deepseek-ai-dsh-compaction-basic/use-this-package/on-demand-condensation-with-compact:
   en: 4c5067e4c57ca708
   zh: 1c0e70319b9b2112
@@ -42,14 +42,14 @@
   en: deb655b3b1860576
   zh: 79f56e41a9dfe01f
 /deepseek-ai-dsh-compaction-basic/understand-the-implementation/design-philosophy:
-  en: ed2d43610d4eaa83
-  zh: b46a1eaad396cdd7
+  en: 6aae44eb96630d48
+  zh: c946e7e5a5fe147f
 /deepseek-ai-dsh-compaction-basic/understand-the-implementation/automatic-triggers-and-overflow-recovery:
-  en: 9e6e472b0f3977d3
-  zh: fdc0e827c19ba401
+  en: 70aa616d45ae65ae
+  zh: 0060ece05737a85a
 /deepseek-ai-dsh-compaction-basic/understand-the-implementation/summarization-mechanics:
-  en: 967531b71453eb88
-  zh: c7919b46e36763e6
+  en: 206f281f6b5e00b1
+  zh: ec907c2bb82f30fa
 /deepseek-ai-dsh-compaction-basic/understand-the-implementation/the-region-transaction:
   en: f4330f6bff22d400
   zh: 46e16c51bb66a0f7
